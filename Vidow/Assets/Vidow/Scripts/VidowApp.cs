@@ -5,6 +5,8 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.RegularExpressions;
 using TMPro;
 using UnityEngine;
@@ -687,7 +689,19 @@ namespace Vidow
 
             StartDownloadInFolder(item, folder);
 #else
-            ShowPathModal(item);
+            var pickStatus = WindowsFolderPicker.PickFolder("Choose download folder", _lastDirectory, out var folder);
+            if (pickStatus == FolderPickStatus.Success)
+            {
+                StartDownloadInFolder(item, folder);
+            }
+            else if (pickStatus == FolderPickStatus.Unavailable || pickStatus == FolderPickStatus.Failed)
+            {
+                ShowPathModal(item);
+            }
+            else
+            {
+                ShowToast("Download cancelled.");
+            }
 #endif
         }
 
@@ -1212,6 +1226,10 @@ namespace Vidow
                 AddLayoutElement(thumbnailRect.gameObject, 104, 58);
                 _thumbnail = _app.AddImage(thumbnailRect.gameObject, Color.white);
                 _thumbnail.sprite = Item.IsDownloadable ? _app._thumbnailPlaceholder : _app._unsupportedPlaceholder;
+                if (!string.IsNullOrWhiteSpace(Item.ThumbnailUrl))
+                {
+                    StartCoroutine(LoadThumbnailRoutine(Item.ThumbnailUrl));
+                }
 
                 var textColumn = CreateRect("Text Column", root);
                 AddLayoutElement(textColumn.gameObject, -1, 74, 1);
@@ -1359,6 +1377,32 @@ namespace Vidow
                 _progressFill.transform.parent.gameObject.SetActive(false);
                 _primaryButtonText.text = "Download";
                 _secondaryButton.gameObject.SetActive(false);
+            }
+
+            private IEnumerator LoadThumbnailRoutine(string url)
+            {
+                using (var request = UnityWebRequestTexture.GetTexture(url))
+                {
+                    request.timeout = 8;
+                    yield return request.SendWebRequest();
+
+                    if (request.result != UnityWebRequest.Result.Success)
+                    {
+                        yield break;
+                    }
+
+                    var texture = DownloadHandlerTexture.GetContent(request);
+                    if (texture == null || texture.width <= 0 || texture.height <= 0)
+                    {
+                        yield break;
+                    }
+
+                    _thumbnail.sprite = Sprite.Create(
+                        texture,
+                        new Rect(0, 0, texture.width, texture.height),
+                        new Vector2(0.5f, 0.5f),
+                        100);
+                }
             }
         }
     }
@@ -1510,7 +1554,9 @@ namespace Vidow
     public static class HtmlVideoParser
     {
         private static readonly Regex SourceRegex = new Regex("<(?:video|source)[^>]+src\\s*=\\s*[\"'](?<url>[^\"']+)[\"'][^>]*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex AnchorRegex = new Regex("<a[^>]+href\\s*=\\s*[\"'](?<url>[^\"']+)[\"'][^>]*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private static readonly Regex MetaVideoRegex = new Regex("<meta[^>]+(?:property|name)\\s*=\\s*[\"'](?:og:video|og:video:url|twitter:player:stream)[\"'][^>]+content\\s*=\\s*[\"'](?<url>[^\"']+)[\"'][^>]*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex MetaVideoReverseRegex = new Regex("<meta[^>]+content\\s*=\\s*[\"'](?<url>[^\"']+)[\"'][^>]+(?:property|name)\\s*=\\s*[\"'](?:og:video|og:video:url|twitter:player:stream)[\"'][^>]*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private static readonly Regex PosterRegex = new Regex("<video[^>]+poster\\s*=\\s*[\"'](?<url>[^\"']+)[\"'][^>]*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private static readonly Regex TitleRegex = new Regex("<title[^>]*>(?<title>.*?)</title>", RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
 
@@ -1558,6 +1604,24 @@ namespace Vidow
             {
                 var resolved = ResolveOptional(pageUri, match.Groups["url"].Value);
                 if (!string.IsNullOrWhiteSpace(resolved))
+                {
+                    yield return resolved;
+                }
+            }
+
+            foreach (Match match in MetaVideoReverseRegex.Matches(html))
+            {
+                var resolved = ResolveOptional(pageUri, match.Groups["url"].Value);
+                if (!string.IsNullOrWhiteSpace(resolved))
+                {
+                    yield return resolved;
+                }
+            }
+
+            foreach (Match match in AnchorRegex.Matches(html))
+            {
+                var resolved = ResolveOptional(pageUri, match.Groups["url"].Value);
+                if (!string.IsNullOrWhiteSpace(resolved) && UrlUtility.IsLikelyDirectVideo(resolved))
                 {
                     yield return resolved;
                 }
@@ -1761,6 +1825,135 @@ namespace Vidow
                 Application.OpenURL("file://" + folder);
             }
         }
+    }
+
+    public static class WindowsFolderPicker
+    {
+        private const uint BifReturnOnlyFileSystemDirs = 0x0001;
+        private const uint BifNewDialogStyle = 0x0040;
+        private const uint BffmInitialized = 1;
+        private const uint BffmSetSelectionW = 0x0467;
+
+        private delegate int BrowseCallbackProc(IntPtr hwnd, uint message, IntPtr lParam, IntPtr lpData);
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct BrowseInfo
+        {
+            public IntPtr Owner;
+            public IntPtr Root;
+            public IntPtr DisplayName;
+            [MarshalAs(UnmanagedType.LPWStr)]
+            public string Title;
+            public uint Flags;
+            public BrowseCallbackProc Callback;
+            public IntPtr Param;
+            public int Image;
+        }
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr SHBrowseForFolder(ref BrowseInfo browseInfo);
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool SHGetPathFromIDList(IntPtr pidl, StringBuilder path);
+
+        [DllImport("ole32.dll")]
+        private static extern void CoTaskMemFree(IntPtr pointer);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr SendMessage(IntPtr hwnd, uint message, IntPtr wParam, string lParam);
+
+        public static FolderPickStatus PickFolder(string title, string initialDirectory, out string folder)
+        {
+            folder = null;
+
+            if (Application.platform != RuntimePlatform.WindowsPlayer && Application.platform != RuntimePlatform.WindowsEditor)
+            {
+                return FolderPickStatus.Unavailable;
+            }
+
+            var displayName = IntPtr.Zero;
+            var initialPath = IntPtr.Zero;
+            var pidl = IntPtr.Zero;
+            BrowseCallbackProc callback = BrowseCallback;
+
+            try
+            {
+                displayName = Marshal.AllocHGlobal(520);
+                initialPath = Marshal.StringToHGlobalUni(initialDirectory ?? string.Empty);
+
+                var browseInfo = new BrowseInfo
+                {
+                    Owner = IntPtr.Zero,
+                    Root = IntPtr.Zero,
+                    DisplayName = displayName,
+                    Title = title,
+                    Flags = BifReturnOnlyFileSystemDirs | BifNewDialogStyle,
+                    Callback = callback,
+                    Param = initialPath,
+                    Image = 0
+                };
+
+                pidl = SHBrowseForFolder(ref browseInfo);
+                if (pidl == IntPtr.Zero)
+                {
+                    return FolderPickStatus.Cancelled;
+                }
+
+                var path = new StringBuilder(1024);
+                if (!SHGetPathFromIDList(pidl, path))
+                {
+                    return FolderPickStatus.Failed;
+                }
+
+                folder = path.ToString();
+                return Directory.Exists(folder) && SafePath.CanWriteToFolder(folder)
+                    ? FolderPickStatus.Success
+                    : FolderPickStatus.Failed;
+            }
+            catch
+            {
+                return FolderPickStatus.Failed;
+            }
+            finally
+            {
+                if (pidl != IntPtr.Zero)
+                {
+                    CoTaskMemFree(pidl);
+                }
+
+                if (displayName != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(displayName);
+                }
+
+                if (initialPath != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(initialPath);
+                }
+            }
+        }
+
+        private static int BrowseCallback(IntPtr hwnd, uint message, IntPtr lParam, IntPtr lpData)
+        {
+            if (message == BffmInitialized && lpData != IntPtr.Zero)
+            {
+                var path = Marshal.PtrToStringUni(lpData);
+                if (!string.IsNullOrWhiteSpace(path))
+                {
+                    SendMessage(hwnd, BffmSetSelectionW, new IntPtr(1), path);
+                }
+            }
+
+            return 0;
+        }
+    }
+
+    public enum FolderPickStatus
+    {
+        Success,
+        Cancelled,
+        Unavailable,
+        Failed
     }
 
     public static class RuntimeSprites
