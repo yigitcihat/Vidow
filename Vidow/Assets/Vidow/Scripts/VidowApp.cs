@@ -104,6 +104,12 @@ namespace Vidow
             _lastDirectory = PlayerPrefs.GetString("Vidow.LastDownloadDirectory", GetDefaultDownloadDirectory());
             CreateSprites();
             EnsureEventSystem();
+            var designPreview = GameObject.Find("Vidow Design Preview Canvas");
+            if (designPreview != null)
+            {
+                designPreview.SetActive(false);
+            }
+
             BuildInterface();
             SetStatus("Ready");
             SetInlineMessage(string.Empty, TextMuted);
