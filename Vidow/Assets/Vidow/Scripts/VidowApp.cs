@@ -65,6 +65,7 @@ namespace Vidow
         private TextMeshProUGUI _statusText;
         private TextMeshProUGUI _inlineMessage;
         private TextMeshProUGUI _resultCountText;
+        private ScrollRect _resultsScrollRect;
         private RectTransform _resultContent;
         private GameObject _emptyState;
         private GameObject _skeletonState;
@@ -328,18 +329,18 @@ namespace Vidow
             AddLayoutElement(scrollRoot.gameObject, -1, -1, 1, 1);
             AddImage(scrollRoot.gameObject, Color.clear);
 
-            var scrollRect = scrollRoot.gameObject.AddComponent<ScrollRect>();
-            scrollRect.horizontal = false;
-            scrollRect.vertical = true;
-            scrollRect.movementType = ScrollRect.MovementType.Clamped;
-            scrollRect.scrollSensitivity = 24;
+            _resultsScrollRect = scrollRoot.gameObject.AddComponent<ScrollRect>();
+            _resultsScrollRect.horizontal = false;
+            _resultsScrollRect.vertical = true;
+            _resultsScrollRect.movementType = ScrollRect.MovementType.Clamped;
+            _resultsScrollRect.scrollSensitivity = 24;
 
             var viewport = CreateRect("Viewport", scrollRoot);
             Stretch(viewport);
             var viewportImage = AddImage(viewport.gameObject, Color.clear);
-            var mask = viewport.gameObject.AddComponent<Mask>();
-            mask.showMaskGraphic = false;
-            scrollRect.viewport = viewport;
+            viewportImage.raycastTarget = true;
+            viewport.gameObject.AddComponent<RectMask2D>();
+            _resultsScrollRect.viewport = viewport;
 
             _resultContent = CreateRect("Content", viewport);
             _resultContent.anchorMin = new Vector2(0, 1);
@@ -355,7 +356,7 @@ namespace Vidow
             contentLayout.childForceExpandWidth = true;
             contentLayout.childForceExpandHeight = false;
             _resultContent.gameObject.AddComponent<ContentSizeFitter>().verticalFit = ContentSizeFitter.FitMode.PreferredSize;
-            scrollRect.content = _resultContent;
+            _resultsScrollRect.content = _resultContent;
 
             _emptyState = CreateEmptyState(_resultContent);
             _skeletonState = CreateSkeletonState(_resultContent);
@@ -808,6 +809,7 @@ namespace Vidow
             var view = ResultItemView.Create(_resultContent, this, item);
             _resultViews.Add(view);
             UpdateResultsCount();
+            RefreshResultsLayout(true);
         }
 
         private void ClearResults()
@@ -825,6 +827,7 @@ namespace Vidow
             _emptyState.SetActive(true);
             _skeletonState.SetActive(false);
             UpdateResultsCount();
+            RefreshResultsLayout(true);
         }
 
         private void BeginDownload(VideoItem item)
@@ -1306,6 +1309,23 @@ namespace Vidow
             _searchButtonLabel.text = resolving ? "..." : "Search";
             _skeletonState.SetActive(resolving);
             _emptyState.SetActive(!resolving && _resultViews.Count == 0);
+            RefreshResultsLayout(false);
+        }
+
+        private void RefreshResultsLayout(bool scrollToTop)
+        {
+            if (_resultContent == null)
+            {
+                return;
+            }
+
+            Canvas.ForceUpdateCanvases();
+            LayoutRebuilder.ForceRebuildLayoutImmediate(_resultContent);
+
+            if (scrollToTop && _resultsScrollRect != null)
+            {
+                _resultsScrollRect.verticalNormalizedPosition = 1f;
+            }
         }
 
         private IEnumerator FocusUrlInputNextFrame()
