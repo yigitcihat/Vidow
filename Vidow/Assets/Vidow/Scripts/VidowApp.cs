@@ -13,6 +13,9 @@ using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.Networking;
 using UnityEngine.UI;
+#if ENABLE_INPUT_SYSTEM
+using UnityEngine.InputSystem.UI;
+#endif
 #if UNITY_EDITOR
 using UnityEditor;
 #endif
@@ -114,6 +117,7 @@ namespace Vidow
             SetStatus("Ready");
             SetInlineMessage(string.Empty, TextMuted);
             UpdateFooterPath();
+            StartCoroutine(FocusUrlInputNextFrame());
         }
 
         private void Update()
@@ -256,7 +260,7 @@ namespace Vidow
 
             var inputFrame = CreateRect("URL Input Frame", searchPanel);
             AddLayoutElement(inputFrame.gameObject, -1, 44, 1);
-            AddImage(inputFrame.gameObject, Surface);
+            AddImage(inputFrame.gameObject, Surface).raycastTarget = false;
             var inputFrameLayout = inputFrame.gameObject.AddComponent<HorizontalLayoutGroup>();
             inputFrameLayout.padding = new RectOffset(12, 6, 0, 0);
             inputFrameLayout.spacing = 8;
@@ -275,6 +279,7 @@ namespace Vidow
             AddLayoutElement(_urlInput.gameObject, -1, 40, 1);
             _urlInput.onValueChanged.AddListener(_ => UpdateSearchButtonState());
             _urlInput.onSubmit.AddListener(_ => StartSearch());
+            _urlInput.gameObject.AddComponent<InputFocusForwarder>().Bind(_urlInput);
 
             var clearButton = CreateButton(inputFrame, "x", "Clear", SurfaceHover, TextSecondary, () =>
             {
@@ -958,6 +963,13 @@ namespace Vidow
             _emptyState.SetActive(!resolving && _resultViews.Count == 0);
         }
 
+        private IEnumerator FocusUrlInputNextFrame()
+        {
+            yield return null;
+            _urlInput.Select();
+            _urlInput.ActivateInputField();
+        }
+
         private void UpdateSearchButtonState()
         {
             if (_searchButton == null)
@@ -1040,13 +1052,33 @@ namespace Vidow
 
         private static void EnsureEventSystem()
         {
-            if (UnityEngine.Object.FindFirstObjectByType<EventSystem>() != null)
+            var eventSystem = UnityEngine.Object.FindFirstObjectByType<EventSystem>();
+            if (eventSystem == null)
             {
-                return;
+                var eventSystemGo = new GameObject("EventSystem", typeof(EventSystem));
+                UnityEngine.Object.DontDestroyOnLoad(eventSystemGo);
+                eventSystem = eventSystemGo.GetComponent<EventSystem>();
             }
 
-            var eventSystem = new GameObject("EventSystem", typeof(EventSystem), typeof(StandaloneInputModule));
-            UnityEngine.Object.DontDestroyOnLoad(eventSystem);
+#if ENABLE_INPUT_SYSTEM
+            var inputSystemModule = eventSystem.GetComponent<InputSystemUIInputModule>();
+            if (inputSystemModule == null)
+            {
+                inputSystemModule = eventSystem.gameObject.AddComponent<InputSystemUIInputModule>();
+            }
+
+            inputSystemModule.AssignDefaultActions();
+
+            foreach (var legacyModule in eventSystem.GetComponents<StandaloneInputModule>())
+            {
+                legacyModule.enabled = false;
+            }
+#else
+            if (eventSystem.GetComponent<StandaloneInputModule>() == null)
+            {
+                eventSystem.gameObject.AddComponent<StandaloneInputModule>();
+            }
+#endif
         }
 
         private static RectTransform CreateRect(string name, Transform parent)
@@ -1083,7 +1115,7 @@ namespace Vidow
         private TMP_InputField CreateInput(Transform parent, string placeholder)
         {
             var root = CreateRect("Input", parent);
-            AddImage(root.gameObject, SurfaceHover);
+            var inputGraphic = AddImage(root.gameObject, SurfaceHover);
 
             var viewport = CreateRect("Text Area", root);
             Stretch(viewport, 12, 12, 4, 4);
@@ -1099,6 +1131,7 @@ namespace Vidow
             placeholderText.alignment = TextAlignmentOptions.MidlineLeft;
 
             var input = root.gameObject.AddComponent<TMP_InputField>();
+            input.targetGraphic = inputGraphic;
             input.textViewport = viewport;
             input.textComponent = text;
             input.placeholder = placeholderText;
@@ -1410,6 +1443,33 @@ namespace Vidow
                         100);
                 }
             }
+        }
+    }
+
+    public sealed class InputFocusForwarder : MonoBehaviour, IPointerClickHandler
+    {
+        private TMP_InputField _input;
+
+        public void Bind(TMP_InputField input)
+        {
+            _input = input;
+        }
+
+        public void OnPointerClick(PointerEventData eventData)
+        {
+            if (_input == null)
+            {
+                _input = GetComponent<TMP_InputField>();
+            }
+
+            if (_input == null)
+            {
+                return;
+            }
+
+            _input.Select();
+            _input.ActivateInputField();
+            _input.MoveTextEnd(false);
         }
     }
 
