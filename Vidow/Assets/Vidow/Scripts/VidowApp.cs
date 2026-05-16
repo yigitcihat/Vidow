@@ -43,6 +43,7 @@ namespace Vidow
         private const int ResolveTimeoutSeconds = 20;
         private const int RequestTimeoutSeconds = 15;
         private const int MaxConcurrentDownloads = 2;
+        private const string BrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36";
 
         private readonly List<VideoItem> _videos = new List<VideoItem>();
         private readonly List<ResultItemView> _resultViews = new List<ResultItemView>();
@@ -624,10 +625,16 @@ namespace Vidow
                 yield break;
             }
 
+            if (DailymotionResolver.TryGetVideoId(uri, out _))
+            {
+                yield return StartCoroutine(ResolveDailymotionVideos(uri, complete));
+                yield break;
+            }
+
             using (var request = UnityWebRequest.Get(uri.AbsoluteUri))
             {
                 request.timeout = RequestTimeoutSeconds;
-                request.SetRequestHeader("User-Agent", "Vidow/1.0 Unity");
+                TrySetRequestHeader(request, "User-Agent", BrowserUserAgent);
                 yield return request.SendWebRequest();
 
                 if (request.result == UnityWebRequest.Result.ConnectionError)
@@ -657,6 +664,140 @@ namespace Vidow
                     UserMessage = string.Empty
                 });
             }
+        }
+
+        private IEnumerator ResolveDailymotionVideos(Uri uri, Action<ResolveResult> complete)
+        {
+            if (!DailymotionResolver.TryGetVideoId(uri, out var videoId))
+            {
+                complete(ResolveResult.Fail(ResolveStatus.UnsupportedSource, "This Dailymotion link is not supported."));
+                yield break;
+            }
+
+            var metadataUrl = $"https://www.dailymotion.com/player/metadata/video/{videoId}";
+            var requestHeaders = DailymotionResolver.CreateRequestHeaders(uri.AbsoluteUri);
+            string metadataJson = null;
+            string metadataError = null;
+            DailymotionMetadata metadata;
+            using (var request = UnityWebRequest.Get(metadataUrl))
+            {
+                request.timeout = RequestTimeoutSeconds;
+                ApplyRequestHeaders(request, requestHeaders);
+                yield return request.SendWebRequest();
+
+                if (request.result == UnityWebRequest.Result.ConnectionError)
+                {
+                    metadataError = request.error;
+                }
+                else if (request.result == UnityWebRequest.Result.Success && !string.IsNullOrWhiteSpace(request.downloadHandler.text))
+                {
+                    metadataJson = request.downloadHandler.text;
+                }
+                else
+                {
+                    metadataError = request.error;
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(metadataJson) &&
+                !CurlUtility.TryGetText(metadataUrl, requestHeaders, RequestTimeoutSeconds, out metadataJson, out metadataError))
+            {
+                complete(ResolveResult.Fail(ResolveStatus.UnsupportedSource, string.IsNullOrWhiteSpace(metadataError) ? "Dailymotion did not return playable metadata for this link." : metadataError));
+                yield break;
+            }
+
+            metadata = DailymotionResolver.ParseMetadata(videoId, uri.AbsoluteUri, metadataJson);
+
+            if (metadata.IsPrivate || metadata.IsPasswordProtected || metadata.IsProtectedDelivery)
+            {
+                complete(ResolveResult.Fail(ResolveStatus.UnsupportedSource, "This Dailymotion video is private, protected, paid, or DRM restricted."));
+                yield break;
+            }
+
+            if (metadata.Sources.Count == 0)
+            {
+                complete(ResolveResult.Fail(ResolveStatus.NoVideosFound, "Dailymotion did not expose downloadable streams for this video."));
+                yield break;
+            }
+
+            var videos = new List<VideoItem>();
+            foreach (var source in metadata.Sources)
+            {
+                if (source.IsHls)
+                {
+                    List<VideoItem> variants = null;
+                    yield return StartCoroutine(ResolveHlsVideoItems(source, metadata, result => variants = result));
+                    if (variants != null)
+                    {
+                        videos.AddRange(variants);
+                    }
+                }
+                else
+                {
+                    videos.Add(DailymotionResolver.CreateDirectVideoItem(source, metadata));
+                }
+            }
+
+            videos = videos
+                .GroupBy(video => video.MediaUrl, StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.First())
+                .OrderByDescending(video => HlsPlaylistParser.QualityRank(video.QualityLabel))
+                .Take(8)
+                .ToList();
+
+            if (videos.Count == 0)
+            {
+                complete(ResolveResult.Fail(ResolveStatus.NoVideosFound, "This Dailymotion video was found, but Vidow could not read its downloadable quality list."));
+                yield break;
+            }
+
+            complete(new ResolveResult
+            {
+                Status = ResolveStatus.Success,
+                Videos = videos,
+                UserMessage = string.Empty
+            });
+        }
+
+        private IEnumerator ResolveHlsVideoItems(DailymotionMediaSource source, DailymotionMetadata metadata, Action<List<VideoItem>> complete)
+        {
+            string playlist = null;
+            using (var request = UnityWebRequest.Get(source.Url))
+            {
+                request.timeout = RequestTimeoutSeconds;
+                ApplyRequestHeaders(request, source.RequestHeaders);
+                yield return request.SendWebRequest();
+
+                if (request.result == UnityWebRequest.Result.Success && !string.IsNullOrWhiteSpace(request.downloadHandler.text))
+                {
+                    playlist = request.downloadHandler.text;
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(playlist) &&
+                !CurlUtility.TryGetText(source.Url, source.RequestHeaders, RequestTimeoutSeconds, out playlist, out _))
+            {
+                complete(new List<VideoItem>());
+                yield break;
+            }
+
+            if (HlsPlaylistParser.ContainsEncryption(playlist))
+            {
+                complete(new List<VideoItem>());
+                yield break;
+            }
+
+            var variants = HlsPlaylistParser.ExtractVariants(source.Url, playlist).ToList();
+            if (variants.Count == 0)
+            {
+                complete(new List<VideoItem> { DailymotionResolver.CreateHlsVideoItem(source, metadata, source.QualityLabel) });
+                yield break;
+            }
+
+            var items = variants
+                .Select(variant => DailymotionResolver.CreateHlsVideoItem(source, metadata, variant.QualityLabel, variant.Url, variant.Bandwidth))
+                .ToList();
+            complete(items);
         }
 
         private void AddResult(VideoItem item)
@@ -821,10 +962,17 @@ namespace Vidow
                 yield break;
             }
 
+            if (job.Video.IsHls)
+            {
+                yield return StartCoroutine(DownloadHlsRoutine(job, startTime, lastBytes, lastSample));
+                yield break;
+            }
+
             using (var request = UnityWebRequest.Get(job.Video.MediaUrl))
             {
                 request.timeout = 0;
                 request.downloadHandler = new DownloadHandlerFile(job.TempFilePath);
+                ApplyRequestHeaders(request, job.Video.RequestHeaders);
                 var op = request.SendWebRequest();
 
                 while (!op.isDone)
@@ -855,6 +1003,204 @@ namespace Vidow
                 }
             }
 
+            CompleteDownloadedFile(job);
+        }
+
+        private IEnumerator DownloadHlsRoutine(DownloadJob job, float startTime, long lastBytes, float lastSample)
+        {
+            List<string> segments = null;
+            var playlistError = string.Empty;
+            yield return StartCoroutine(ResolveHlsSegments(job.Video, (resolvedSegments, error) =>
+            {
+                segments = resolvedSegments;
+                playlistError = error;
+            }));
+
+            if (job.CancelRequested)
+            {
+                CancelJob(job);
+                yield break;
+            }
+
+            if (!string.IsNullOrWhiteSpace(playlistError) || segments == null || segments.Count == 0)
+            {
+                FailJob(job, "Vidow could not read this HLS video stream.", playlistError);
+                yield break;
+            }
+
+            var cancelled = false;
+            var failed = false;
+            var technicalError = string.Empty;
+            long bytesWritten = 0;
+            FileStream output;
+
+            try
+            {
+                output = new FileStream(job.TempFilePath, FileMode.Create, FileAccess.Write, FileShare.None);
+            }
+            catch (Exception ex)
+            {
+                FailJob(job, "Vidow cannot write to this folder. Choose another location.", ex.Message);
+                yield break;
+            }
+
+            using (output)
+            {
+                for (var i = 0; i < segments.Count; i++)
+                {
+                    if (job.CancelRequested)
+                    {
+                        cancelled = true;
+                        break;
+                    }
+
+                    using (var request = UnityWebRequest.Get(segments[i]))
+                    {
+                        request.timeout = 0;
+                        request.downloadHandler = new DownloadHandlerBuffer();
+                        ApplyRequestHeaders(request, job.Video.RequestHeaders);
+                        var op = request.SendWebRequest();
+
+                        while (!op.isDone)
+                        {
+                            if (job.CancelRequested)
+                            {
+                                request.Abort();
+                                cancelled = true;
+                                break;
+                            }
+
+                            UpdateHlsDownloadProgress(job, i, segments.Count, bytesWritten + unchecked((long)request.downloadedBytes), ref lastBytes, ref lastSample);
+                            yield return null;
+                        }
+
+                        if (cancelled)
+                        {
+                            break;
+                        }
+
+                        if (request.result != UnityWebRequest.Result.Success)
+                        {
+                            failed = true;
+                            technicalError = request.error;
+                            break;
+                        }
+
+                        var data = request.downloadHandler.data;
+                        if (data == null || data.Length == 0)
+                        {
+                            failed = true;
+                            technicalError = "An HLS media segment was empty.";
+                            break;
+                        }
+
+                        try
+                        {
+                            output.Write(data, 0, data.Length);
+                        }
+                        catch (Exception ex)
+                        {
+                            failed = true;
+                            technicalError = ex.Message;
+                            break;
+                        }
+
+                        bytesWritten += data.LongLength;
+                        UpdateHlsDownloadProgress(job, i + 1, segments.Count, bytesWritten, ref lastBytes, ref lastSample);
+                    }
+                }
+            }
+
+            if (cancelled)
+            {
+                CancelJob(job);
+                yield break;
+            }
+
+            if (failed)
+            {
+                FailJob(job, "The HLS download failed. Check your connection and try again.", technicalError);
+                yield break;
+            }
+
+            job.Progress.Percent = 1f;
+            job.Progress.BytesDownloaded = bytesWritten;
+            CompleteDownloadedFile(job);
+        }
+
+        private IEnumerator ResolveHlsSegments(VideoItem video, Action<List<string>, string> complete)
+        {
+            var playlistUrl = video.MediaUrl;
+
+            for (var depth = 0; depth < 3; depth++)
+            {
+                string playlist = null;
+                string requestError = null;
+                using (var request = UnityWebRequest.Get(playlistUrl))
+                {
+                    request.timeout = RequestTimeoutSeconds;
+                    ApplyRequestHeaders(request, video.RequestHeaders);
+                    yield return request.SendWebRequest();
+
+                    if (request.result == UnityWebRequest.Result.Success && !string.IsNullOrWhiteSpace(request.downloadHandler.text))
+                    {
+                        playlist = request.downloadHandler.text;
+                    }
+                    else
+                    {
+                        requestError = request.error;
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(playlist) &&
+                    !CurlUtility.TryGetText(playlistUrl, video.RequestHeaders, RequestTimeoutSeconds, out playlist, out requestError))
+                {
+                    complete(null, requestError);
+                    yield break;
+                }
+
+                if (HlsPlaylistParser.ContainsEncryption(playlist))
+                {
+                    complete(null, "Encrypted HLS streams are not supported.");
+                    yield break;
+                }
+
+                var variants = HlsPlaylistParser.ExtractVariants(playlistUrl, playlist).ToList();
+                if (variants.Count > 0)
+                {
+                    playlistUrl = variants.OrderByDescending(variant => variant.Bandwidth ?? 0).First().Url;
+                    continue;
+                }
+
+                var segments = HlsPlaylistParser.ExtractSegments(playlistUrl, playlist).ToList();
+                complete(segments, segments.Count == 0 ? "No HLS media segments were found." : string.Empty);
+                yield break;
+            }
+
+            complete(null, "The HLS playlist redirects too deeply.");
+        }
+
+        private void UpdateHlsDownloadProgress(DownloadJob job, int completedSegments, int totalSegments, long bytes, ref long lastBytes, ref float lastSample)
+        {
+            var now = Time.realtimeSinceStartup;
+
+            if (now - lastSample >= 0.25f)
+            {
+                var deltaBytes = bytes - lastBytes;
+                var deltaTime = Mathf.Max(0.01f, now - lastSample);
+                job.Progress.BytesPerSecond = Math.Max(0, deltaBytes / deltaTime);
+                lastBytes = bytes;
+                lastSample = now;
+            }
+
+            job.Progress.BytesDownloaded = Math.Max(0, bytes);
+            job.Progress.TotalBytes = job.Video.SizeBytes;
+            job.Progress.Percent = totalSegments > 0 ? Mathf.Clamp01((float)completedSegments / totalSegments) : (float?)null;
+            job.View?.SetDownloading(job.Progress);
+        }
+
+        private void CompleteDownloadedFile(DownloadJob job)
+        {
             try
             {
                 if (File.Exists(job.FinalFilePath))
@@ -872,7 +1218,6 @@ namespace Vidow
             catch (Exception ex)
             {
                 FailJob(job, "Vidow cannot write to this folder. Choose another location.", ex.Message);
-                yield break;
             }
         }
 
@@ -1201,6 +1546,36 @@ namespace Vidow
             return null;
         }
 
+        private static void ApplyRequestHeaders(UnityWebRequest request, IDictionary<string, string> headers)
+        {
+            if (request == null || headers == null)
+            {
+                return;
+            }
+
+            foreach (var header in headers)
+            {
+                TrySetRequestHeader(request, header.Key, header.Value);
+            }
+        }
+
+        private static void TrySetRequestHeader(UnityWebRequest request, string name, string value)
+        {
+            if (request == null || string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(value))
+            {
+                return;
+            }
+
+            try
+            {
+                request.SetRequestHeader(name, value);
+            }
+            catch
+            {
+                // Unity blocks a few browser-owned headers on some platforms.
+            }
+        }
+
         private static string GetDefaultDownloadDirectory()
         {
             var user = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
@@ -1486,8 +1861,10 @@ namespace Vidow
         public string QualityLabel;
         public long? SizeBytes;
         public TimeSpan? Duration;
+        public bool IsHls;
         public bool IsDownloadable = true;
         public string UnsupportedReason;
+        public Dictionary<string, string> RequestHeaders = new Dictionary<string, string>();
 
         public string SafeFileName => SafePath.SanitizeFileName($"{Title}.{(string.IsNullOrWhiteSpace(Extension) ? "mp4" : Extension.TrimStart('.'))}");
 
@@ -1613,7 +1990,824 @@ namespace Vidow
                 return $"{Mathf.RoundToInt(Percent.Value * 100)}% - {ByteFormatter.Format(BytesDownloaded)} / {ByteFormatter.Format(TotalBytes.Value)} - {speed}{eta}";
             }
 
+            if (Percent.HasValue)
+            {
+                return $"{Mathf.RoundToInt(Percent.Value * 100)}% - {ByteFormatter.Format(BytesDownloaded)} downloaded - {speed}";
+            }
+
             return $"{ByteFormatter.Format(BytesDownloaded)} downloaded - {speed}";
+        }
+    }
+
+    public sealed class DailymotionMetadata
+    {
+        public string VideoId;
+        public string PageUrl;
+        public string Title;
+        public string ThumbnailUrl;
+        public TimeSpan? Duration;
+        public bool IsPrivate;
+        public bool IsPasswordProtected;
+        public bool IsProtectedDelivery;
+        public List<DailymotionMediaSource> Sources = new List<DailymotionMediaSource>();
+    }
+
+    public sealed class DailymotionMediaSource
+    {
+        public string VideoId;
+        public string PageUrl;
+        public string Url;
+        public string MimeType;
+        public string QualityLabel;
+        public bool IsHls;
+        public Dictionary<string, string> RequestHeaders = new Dictionary<string, string>();
+    }
+
+    public static class CurlUtility
+    {
+        public static bool TryGetText(string url, IDictionary<string, string> headers, int timeoutSeconds, out string text, out string error)
+        {
+            text = null;
+            error = null;
+
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                error = "Missing URL.";
+                return false;
+            }
+
+            try
+            {
+                var arguments = new List<string>
+                {
+                    "-sSLf",
+                    "--max-time",
+                    Mathf.Max(1, timeoutSeconds).ToString(CultureInfo.InvariantCulture)
+                };
+
+                if (headers != null)
+                {
+                    foreach (var header in headers)
+                    {
+                        if (!string.IsNullOrWhiteSpace(header.Key) && !string.IsNullOrWhiteSpace(header.Value))
+                        {
+                            arguments.Add("-H");
+                            arguments.Add($"{header.Key}: {header.Value}");
+                        }
+                    }
+                }
+
+                arguments.Add(url);
+
+                var processInfo = new ProcessStartInfo
+                {
+                    FileName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "curl.exe" : "curl",
+                    Arguments = string.Join(" ", arguments.Select(QuoteArgument)),
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+
+                using (var process = Process.Start(processInfo))
+                {
+                    if (process == null)
+                    {
+                        error = "curl.exe could not be started.";
+                        return false;
+                    }
+
+                    text = process.StandardOutput.ReadToEnd();
+                    error = process.StandardError.ReadToEnd();
+                    if (!process.WaitForExit((Mathf.Max(1, timeoutSeconds) + 3) * 1000))
+                    {
+                        TryKill(process);
+                        error = "curl.exe timed out.";
+                        return false;
+                    }
+
+                    if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(text))
+                    {
+                        if (string.IsNullOrWhiteSpace(error))
+                        {
+                            error = $"curl.exe exited with code {process.ExitCode}.";
+                        }
+
+                        return false;
+                    }
+
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        private static string QuoteArgument(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return "\"\"";
+            }
+
+            return "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+        }
+
+        private static void TryKill(Process process)
+        {
+            try
+            {
+                if (process != null && !process.HasExited)
+                {
+                    process.Kill();
+                }
+            }
+            catch
+            {
+                // Best-effort cleanup.
+            }
+        }
+    }
+
+    public static class DailymotionResolver
+    {
+        private const string BrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36";
+        private static readonly Regex VideoPathRegex = new Regex(@"^/(?:video|embed/video)/(?<id>[A-Za-z0-9]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        public static bool TryGetVideoId(Uri uri, out string videoId)
+        {
+            videoId = null;
+            if (uri == null)
+            {
+                return false;
+            }
+
+            var host = uri.Host.ToLowerInvariant();
+            if (host == "dai.ly" || host.EndsWith(".dai.ly", StringComparison.OrdinalIgnoreCase))
+            {
+                var id = uri.AbsolutePath.Trim('/').Split('/').FirstOrDefault();
+                if (!string.IsNullOrWhiteSpace(id))
+                {
+                    videoId = id;
+                    return true;
+                }
+            }
+
+            if (!host.EndsWith("dailymotion.com", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var match = VideoPathRegex.Match(uri.AbsolutePath);
+            if (match.Success)
+            {
+                videoId = match.Groups["id"].Value;
+                return true;
+            }
+
+            return false;
+        }
+
+        public static DailymotionMetadata ParseMetadata(string videoId, string pageUrl, string json)
+        {
+            var metadata = new DailymotionMetadata
+            {
+                VideoId = videoId,
+                PageUrl = pageUrl,
+                Title = NormalizeTitle(JsonValue(json, "title")) ?? $"Dailymotion {videoId}",
+                ThumbnailUrl = ExtractBestThumbnail(json),
+                IsPrivate = JsonBool(json, "private"),
+                IsPasswordProtected = JsonBool(json, "is_password_protected"),
+                IsProtectedDelivery = JsonBool(json, "protected_delivery")
+            };
+
+            var durationSeconds = JsonNumber(json, "duration");
+            if (durationSeconds.HasValue && durationSeconds.Value > 0)
+            {
+                metadata.Duration = TimeSpan.FromSeconds(durationSeconds.Value);
+            }
+
+            foreach (var source in ExtractSources(videoId, pageUrl, json))
+            {
+                metadata.Sources.Add(source);
+            }
+
+            return metadata;
+        }
+
+        public static Dictionary<string, string> CreateRequestHeaders(string pageUrl)
+        {
+            return new Dictionary<string, string>
+            {
+                { "User-Agent", BrowserUserAgent },
+                { "Accept", "*/*" },
+                { "Referer", string.IsNullOrWhiteSpace(pageUrl) ? "https://www.dailymotion.com/" : pageUrl },
+                { "Origin", "https://www.dailymotion.com" },
+                { "X-Requested-With", "XMLHttpRequest" }
+            };
+        }
+
+        public static VideoItem CreateDirectVideoItem(DailymotionMediaSource source, DailymotionMetadata metadata)
+        {
+            var item = VideoItem.FromUrl(source.Url, source.MimeType, null);
+            item.Id = Guid.NewGuid().ToString("N");
+            item.PageUrl = metadata.PageUrl;
+            item.Title = AppendQuality(metadata.Title, source.QualityLabel);
+            item.SourceDomain = "dailymotion.com";
+            item.ThumbnailUrl = metadata.ThumbnailUrl;
+            item.Duration = metadata.Duration;
+            item.QualityLabel = NormalizeQualityLabel(source.QualityLabel);
+            item.RequestHeaders = new Dictionary<string, string>(source.RequestHeaders);
+            return item;
+        }
+
+        public static VideoItem CreateHlsVideoItem(DailymotionMediaSource source, DailymotionMetadata metadata, string qualityLabel, string mediaUrl = null, int? bandwidth = null)
+        {
+            var normalizedQuality = NormalizeQualityLabel(qualityLabel);
+            var displayQuality = normalizedQuality.IndexOf("hls", StringComparison.OrdinalIgnoreCase) >= 0 ? normalizedQuality : $"{normalizedQuality} HLS";
+            var item = new VideoItem
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                PageUrl = metadata.PageUrl,
+                MediaUrl = string.IsNullOrWhiteSpace(mediaUrl) ? source.Url : mediaUrl,
+                Title = AppendQuality(metadata.Title, normalizedQuality),
+                SourceDomain = "dailymotion.com",
+                ThumbnailUrl = metadata.ThumbnailUrl,
+                Extension = "ts",
+                MimeType = "video/mp2t",
+                QualityLabel = displayQuality,
+                Duration = metadata.Duration,
+                IsHls = true,
+                RequestHeaders = new Dictionary<string, string>(source.RequestHeaders)
+            };
+
+            if (bandwidth.HasValue && metadata.Duration.HasValue)
+            {
+                item.SizeBytes = (long)Math.Max(0, metadata.Duration.Value.TotalSeconds * bandwidth.Value / 8d);
+            }
+
+            return item;
+        }
+
+        private static IEnumerable<DailymotionMediaSource> ExtractSources(string videoId, string pageUrl, string json)
+        {
+            var qualities = ExtractJsonObject(json, "qualities");
+            if (string.IsNullOrWhiteSpace(qualities))
+            {
+                yield break;
+            }
+
+            var urls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var block in ExtractQualityBlocks(qualities))
+            {
+                foreach (var itemJson in ExtractJsonObjects(block.ArrayJson))
+                {
+                    var url = JsonValue(itemJson, "url");
+                    if (string.IsNullOrWhiteSpace(url) || !urls.Add(url))
+                    {
+                        continue;
+                    }
+
+                    var mimeType = JsonValue(itemJson, "type");
+                    yield return new DailymotionMediaSource
+                    {
+                        VideoId = videoId,
+                        PageUrl = pageUrl,
+                        Url = url,
+                        MimeType = mimeType,
+                        IsHls = IsHls(mimeType, url),
+                        QualityLabel = NormalizeQualityLabel(block.Quality),
+                        RequestHeaders = CreateRequestHeaders(pageUrl)
+                    };
+                }
+            }
+        }
+
+        private static bool IsHls(string mimeType, string url)
+        {
+            return (!string.IsNullOrWhiteSpace(mimeType) && mimeType.IndexOf("mpegurl", StringComparison.OrdinalIgnoreCase) >= 0) ||
+                   (!string.IsNullOrWhiteSpace(url) && url.IndexOf(".m3u8", StringComparison.OrdinalIgnoreCase) >= 0);
+        }
+
+        private static string AppendQuality(string title, string quality)
+        {
+            quality = NormalizeQualityLabel(quality);
+            if (string.IsNullOrWhiteSpace(quality) || quality == "Source")
+            {
+                return title;
+            }
+
+            return $"{title} ({quality})";
+        }
+
+        private static string NormalizeQualityLabel(string quality)
+        {
+            if (string.IsNullOrWhiteSpace(quality))
+            {
+                return "Source";
+            }
+
+            quality = quality.Trim();
+            if (quality.Equals("auto", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Auto";
+            }
+
+            return Regex.IsMatch(quality, @"^\d+$") ? quality + "p" : quality;
+        }
+
+        private static string NormalizeTitle(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return null;
+            }
+
+            return Regex.Replace(value, "\\s+", " ").Trim();
+        }
+
+        private static string ExtractBestThumbnail(string json)
+        {
+            var thumbnails = ExtractJsonObject(json, "thumbnails");
+            if (string.IsNullOrWhiteSpace(thumbnails))
+            {
+                return null;
+            }
+
+            var bestSize = -1;
+            string bestUrl = null;
+            foreach (Match match in Regex.Matches(thumbnails, "\"(?<size>\\d+)\"\\s*:\\s*\"(?<url>(?:\\\\.|[^\"\\\\])*)\"", RegexOptions.Singleline))
+            {
+                var url = JsonUnescape(match.Groups["url"].Value);
+                if (int.TryParse(match.Groups["size"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var size) && size > bestSize)
+                {
+                    bestSize = size;
+                    bestUrl = url;
+                }
+            }
+
+            return bestUrl;
+        }
+
+        private static IEnumerable<QualityBlock> ExtractQualityBlocks(string qualitiesJson)
+        {
+            var index = 0;
+            while (index < qualitiesJson.Length)
+            {
+                var match = Regex.Match(qualitiesJson.Substring(index), "\"(?<quality>[^\"\\\\]+)\"\\s*:");
+                if (!match.Success)
+                {
+                    yield break;
+                }
+
+                var quality = JsonUnescape(match.Groups["quality"].Value);
+                var cursor = SkipWhitespace(qualitiesJson, index + match.Index + match.Length);
+                if (cursor >= qualitiesJson.Length || qualitiesJson[cursor] != '[')
+                {
+                    index = cursor + 1;
+                    continue;
+                }
+
+                var end = FindMatching(qualitiesJson, cursor, '[', ']');
+                if (end <= cursor)
+                {
+                    yield break;
+                }
+
+                yield return new QualityBlock
+                {
+                    Quality = quality,
+                    ArrayJson = qualitiesJson.Substring(cursor + 1, end - cursor - 1)
+                };
+                index = end + 1;
+            }
+        }
+
+        private static IEnumerable<string> ExtractJsonObjects(string arrayJson)
+        {
+            var index = 0;
+            while (index < arrayJson.Length)
+            {
+                var start = arrayJson.IndexOf('{', index);
+                if (start < 0)
+                {
+                    yield break;
+                }
+
+                var end = FindMatching(arrayJson, start, '{', '}');
+                if (end <= start)
+                {
+                    yield break;
+                }
+
+                yield return arrayJson.Substring(start, end - start + 1);
+                index = end + 1;
+            }
+        }
+
+        private static string JsonValue(string json, string key)
+        {
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return null;
+            }
+
+            var match = Regex.Match(json, "\"" + Regex.Escape(key) + "\"\\s*:\\s*\"(?<value>(?:\\\\.|[^\"\\\\])*)\"", RegexOptions.Singleline);
+            return match.Success ? JsonUnescape(match.Groups["value"].Value) : null;
+        }
+
+        private static bool JsonBool(string json, string key)
+        {
+            var match = Regex.Match(json ?? string.Empty, "\"" + Regex.Escape(key) + "\"\\s*:\\s*(?<value>true|false)", RegexOptions.IgnoreCase);
+            return match.Success && match.Groups["value"].Value.Equals("true", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static double? JsonNumber(string json, string key)
+        {
+            var match = Regex.Match(json ?? string.Empty, "\"" + Regex.Escape(key) + "\"\\s*:\\s*(?<value>-?\\d+(?:\\.\\d+)?)", RegexOptions.IgnoreCase);
+            if (match.Success && double.TryParse(match.Groups["value"].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+            {
+                return value;
+            }
+
+            return null;
+        }
+
+        private static string ExtractJsonObject(string json, string key)
+        {
+            var match = Regex.Match(json ?? string.Empty, "\"" + Regex.Escape(key) + "\"\\s*:");
+            if (!match.Success)
+            {
+                return null;
+            }
+
+            var start = SkipWhitespace(json, match.Index + match.Length);
+            if (start >= json.Length || json[start] != '{')
+            {
+                return null;
+            }
+
+            var end = FindMatching(json, start, '{', '}');
+            return end > start ? json.Substring(start + 1, end - start - 1) : null;
+        }
+
+        private static int SkipWhitespace(string value, int index)
+        {
+            while (index < value.Length && char.IsWhiteSpace(value[index]))
+            {
+                index++;
+            }
+
+            return index;
+        }
+
+        private static int FindMatching(string value, int start, char open, char close)
+        {
+            var depth = 0;
+            var inString = false;
+            var escaped = false;
+
+            for (var i = start; i < value.Length; i++)
+            {
+                var c = value[i];
+                if (inString)
+                {
+                    if (escaped)
+                    {
+                        escaped = false;
+                    }
+                    else if (c == '\\')
+                    {
+                        escaped = true;
+                    }
+                    else if (c == '"')
+                    {
+                        inString = false;
+                    }
+
+                    continue;
+                }
+
+                if (c == '"')
+                {
+                    inString = true;
+                }
+                else if (c == open)
+                {
+                    depth++;
+                }
+                else if (c == close)
+                {
+                    depth--;
+                    if (depth == 0)
+                    {
+                        return i;
+                    }
+                }
+            }
+
+            return -1;
+        }
+
+        private static string JsonUnescape(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return value;
+            }
+
+            var builder = new StringBuilder(value.Length);
+            for (var i = 0; i < value.Length; i++)
+            {
+                var c = value[i];
+                if (c != '\\' || i + 1 >= value.Length)
+                {
+                    builder.Append(c);
+                    continue;
+                }
+
+                var next = value[++i];
+                switch (next)
+                {
+                    case '"':
+                    case '\\':
+                    case '/':
+                        builder.Append(next);
+                        break;
+                    case 'b':
+                        builder.Append('\b');
+                        break;
+                    case 'f':
+                        builder.Append('\f');
+                        break;
+                    case 'n':
+                        builder.Append('\n');
+                        break;
+                    case 'r':
+                        builder.Append('\r');
+                        break;
+                    case 't':
+                        builder.Append('\t');
+                        break;
+                    case 'u':
+                        if (i + 4 < value.Length &&
+                            int.TryParse(value.Substring(i + 1, 4), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var code))
+                        {
+                            builder.Append((char)code);
+                            i += 4;
+                        }
+                        break;
+                    default:
+                        builder.Append(next);
+                        break;
+                }
+            }
+
+            return builder.ToString();
+        }
+
+        private sealed class QualityBlock
+        {
+            public string Quality;
+            public string ArrayJson;
+        }
+    }
+
+    public sealed class HlsVariant
+    {
+        public string Url;
+        public string QualityLabel;
+        public int? Bandwidth;
+    }
+
+    public static class HlsPlaylistParser
+    {
+        public static IEnumerable<HlsVariant> ExtractVariants(string playlistUrl, string playlist)
+        {
+            string pendingInfo = null;
+            foreach (var rawLine in ReadLines(playlist))
+            {
+                var line = rawLine.Trim();
+                if (line.StartsWith("#EXT-X-STREAM-INF:", StringComparison.OrdinalIgnoreCase))
+                {
+                    pendingInfo = line.Substring(line.IndexOf(':') + 1);
+                    continue;
+                }
+
+                if (pendingInfo == null || string.IsNullOrWhiteSpace(line) || line.StartsWith("#", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var attributes = ParseAttributes(pendingInfo);
+                var bandwidth = GetInt(attributes, "BANDWIDTH");
+                yield return new HlsVariant
+                {
+                    Url = ResolveUrl(playlistUrl, line),
+                    QualityLabel = BuildQualityLabel(attributes),
+                    Bandwidth = bandwidth
+                };
+                pendingInfo = null;
+            }
+        }
+
+        public static IEnumerable<string> ExtractSegments(string playlistUrl, string playlist)
+        {
+            foreach (var rawLine in ReadLines(playlist))
+            {
+                var line = rawLine.Trim();
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                if (line.StartsWith("#EXT-X-MAP:", StringComparison.OrdinalIgnoreCase))
+                {
+                    var attributes = ParseAttributes(line.Substring(line.IndexOf(':') + 1));
+                    if (attributes.TryGetValue("URI", out var mapUri) && !string.IsNullOrWhiteSpace(mapUri))
+                    {
+                        yield return ResolveUrl(playlistUrl, mapUri);
+                    }
+
+                    continue;
+                }
+
+                if (line.StartsWith("#", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                yield return ResolveUrl(playlistUrl, line);
+            }
+        }
+
+        public static bool ContainsEncryption(string playlist)
+        {
+            foreach (var rawLine in ReadLines(playlist))
+            {
+                var line = rawLine.Trim();
+                if (line.StartsWith("#EXT-X-KEY:", StringComparison.OrdinalIgnoreCase) &&
+                    line.IndexOf("METHOD=NONE", StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        public static int QualityRank(string label)
+        {
+            if (string.IsNullOrWhiteSpace(label))
+            {
+                return 0;
+            }
+
+            var match = Regex.Match(label, @"(?<height>\d{3,4})p", RegexOptions.IgnoreCase);
+            if (match.Success && int.TryParse(match.Groups["height"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var height))
+            {
+                return height;
+            }
+
+            return 0;
+        }
+
+        private static IEnumerable<string> ReadLines(string value)
+        {
+            using (var reader = new StringReader(value ?? string.Empty))
+            {
+                string line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    yield return line;
+                }
+            }
+        }
+
+        private static string ResolveUrl(string baseUrl, string value)
+        {
+            try
+            {
+                return new Uri(new Uri(baseUrl), value.Trim()).AbsoluteUri;
+            }
+            catch
+            {
+                return value.Trim();
+            }
+        }
+
+        private static string BuildQualityLabel(Dictionary<string, string> attributes)
+        {
+            if (attributes.TryGetValue("RESOLUTION", out var resolution))
+            {
+                var match = Regex.Match(resolution, @"x(?<height>\d+)$", RegexOptions.IgnoreCase);
+                if (match.Success)
+                {
+                    return match.Groups["height"].Value + "p";
+                }
+            }
+
+            if (attributes.TryGetValue("NAME", out var name) && !string.IsNullOrWhiteSpace(name))
+            {
+                return Regex.IsMatch(name, @"^\d+$") ? name + "p" : name;
+            }
+
+            var bandwidth = GetInt(attributes, "BANDWIDTH");
+            if (bandwidth.HasValue)
+            {
+                return Mathf.RoundToInt(bandwidth.Value / 1000f) + "kbps";
+            }
+
+            return "HLS";
+        }
+
+        private static int? GetInt(Dictionary<string, string> attributes, string key)
+        {
+            if (attributes.TryGetValue(key, out var value) &&
+                int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+            {
+                return parsed;
+            }
+
+            return null;
+        }
+
+        private static Dictionary<string, string> ParseAttributes(string value)
+        {
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var index = 0;
+            while (index < value.Length)
+            {
+                while (index < value.Length && (char.IsWhiteSpace(value[index]) || value[index] == ','))
+                {
+                    index++;
+                }
+
+                var keyStart = index;
+                while (index < value.Length && value[index] != '=' && value[index] != ',')
+                {
+                    index++;
+                }
+
+                if (index >= value.Length || value[index] != '=')
+                {
+                    break;
+                }
+
+                var key = value.Substring(keyStart, index - keyStart).Trim();
+                index++;
+
+                string attributeValue;
+                if (index < value.Length && value[index] == '"')
+                {
+                    index++;
+                    var builder = new StringBuilder();
+                    var escaped = false;
+                    while (index < value.Length)
+                    {
+                        var c = value[index++];
+                        if (escaped)
+                        {
+                            builder.Append(c);
+                            escaped = false;
+                        }
+                        else if (c == '\\')
+                        {
+                            escaped = true;
+                        }
+                        else if (c == '"')
+                        {
+                            break;
+                        }
+                        else
+                        {
+                            builder.Append(c);
+                        }
+                    }
+
+                    attributeValue = builder.ToString();
+                }
+                else
+                {
+                    var valueStart = index;
+                    while (index < value.Length && value[index] != ',')
+                    {
+                        index++;
+                    }
+
+                    attributeValue = value.Substring(valueStart, index - valueStart).Trim();
+                }
+
+                if (!string.IsNullOrWhiteSpace(key))
+                {
+                    result[key] = attributeValue;
+                }
+            }
+
+            return result;
         }
     }
 
