@@ -985,7 +985,8 @@ namespace Vidow
             UpdateFooterPath();
 
             var finalPath = SafePath.GetUniqueFilePath(folder, item.SafeFileName);
-            var tempPath = finalPath + ".part";
+            var tempPath = item.IsExternal ? YtDlpBridge.GetStagingFilePath(finalPath) : finalPath + ".part";
+            Directory.CreateDirectory(Path.GetDirectoryName(tempPath));
             var job = new DownloadJob(item, folder, finalPath, tempPath);
             var view = _resultViews.FirstOrDefault(v => v.Item.Id == item.Id);
             if (view != null)
@@ -1126,13 +1127,13 @@ namespace Vidow
 
             if (run.ExitCode != 0)
             {
-                FailJob(job, "The external downloader failed for this source.", run.ErrorTail);
+                FailJob(job, ExternalDownloadFailureMessage(run.ErrorTail), run.ErrorTail);
                 yield break;
             }
 
             if (!File.Exists(job.TempFilePath))
             {
-                FailJob(job, "The external downloader finished but did not create a video file.", run.ErrorTail);
+                FailJob(job, ExternalDownloadFailureMessage(run.ErrorTail, "The external downloader finished but did not create a video file."), run.ErrorTail);
                 yield break;
             }
 
@@ -1383,6 +1384,44 @@ namespace Vidow
             }
 
             return 0;
+        }
+
+        private static string ExternalDownloadFailureMessage(string details, string fallback = "The external downloader failed for this source.")
+        {
+            details = Regex.Replace(details ?? string.Empty, "\\s+", " ").Trim();
+            if (string.IsNullOrWhiteSpace(details))
+            {
+                return fallback;
+            }
+
+            if (details.IndexOf("ffmpeg", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                details.IndexOf("ffprobe", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                details.IndexOf("merg", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return "FFmpeg is required for this format. Try a lower MP4 quality or add FFmpeg support.";
+            }
+
+            if (details.IndexOf("permission", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                details.IndexOf("access is denied", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return "Windows blocked the external downloader from writing this file. Try another folder.";
+            }
+
+            if (details.IndexOf("private", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                details.IndexOf("login", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                details.IndexOf("sign in", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return "This source needs sign-in or is not publicly downloadable.";
+            }
+
+            if (details.IndexOf("copyright", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                details.IndexOf("drm", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                details.IndexOf("protected", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return "This source is protected and cannot be downloaded by Vidow.";
+            }
+
+            return details.Length > 150 ? details.Substring(0, 150) + "..." : details;
         }
 
         private void CompleteDownloadedFile(DownloadJob job)

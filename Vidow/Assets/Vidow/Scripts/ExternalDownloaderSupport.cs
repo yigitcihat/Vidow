@@ -302,6 +302,7 @@ namespace Vidow
         {
             var format = string.IsNullOrWhiteSpace(video.ExternalFormatSelector) ? DefaultFormatSelector : video.ExternalFormatSelector;
             var toolDirectory = GetToolDirectory(executablePath);
+            var tempDirectory = GetToolTempDirectory(executablePath);
             return ExternalProcessRun.Start(executablePath, new[]
             {
                 "--newline",
@@ -309,12 +310,27 @@ namespace Vidow
                 "--no-playlist",
                 "--no-mtime",
                 "--force-overwrites",
+                "--paths",
+                "temp:" + tempDirectory,
                 "-f",
                 format,
                 "-o",
                 outputPath,
                 string.IsNullOrWhiteSpace(video.ExternalSourceUrl) ? video.PageUrl : video.ExternalSourceUrl
             }, toolDirectory, CreateToolEnvironment(executablePath));
+        }
+
+        public static string GetStagingFilePath(string finalFilePath)
+        {
+            var stagingDirectory = Path.Combine(GetToolRootDirectory(), "Downloads");
+            Directory.CreateDirectory(stagingDirectory);
+            var fileName = Path.GetFileName(finalFilePath);
+            if (string.IsNullOrWhiteSpace(fileName))
+            {
+                fileName = "download.mp4";
+            }
+
+            return Path.Combine(stagingDirectory, Guid.NewGuid().ToString("N") + "-" + fileName + ".part");
         }
 
         public static List<VideoItem> ParseVideoItems(string json, string originalUrl)
@@ -607,7 +623,7 @@ namespace Vidow
         private static string GetLocalExecutablePath()
         {
             var name = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "yt-dlp.exe" : "yt-dlp";
-            return Path.Combine(Application.persistentDataPath, "VidowTools", name);
+            return Path.Combine(GetToolRootDirectory(), name);
         }
 
         private static string GetToolDirectory(string executablePath)
@@ -617,12 +633,12 @@ namespace Vidow
                 return Path.GetDirectoryName(executablePath);
             }
 
-            return Path.Combine(Application.persistentDataPath, "VidowTools");
+            return GetToolRootDirectory();
         }
 
         private static Dictionary<string, string> CreateToolEnvironment(string executablePath)
         {
-            var tempDirectory = Path.Combine(GetToolDirectory(executablePath), "Temp");
+            var tempDirectory = GetToolTempDirectory(executablePath);
             Directory.CreateDirectory(tempDirectory);
             return new Dictionary<string, string>
             {
@@ -631,6 +647,28 @@ namespace Vidow
                 { "TMPDIR", tempDirectory },
                 { "PYTHONUTF8", "1" }
             };
+        }
+
+        private static string GetToolTempDirectory(string executablePath)
+        {
+            return Path.Combine(GetToolDirectory(executablePath), "Temp");
+        }
+
+        private static string GetToolRootDirectory()
+        {
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(Application.persistentDataPath))
+                {
+                    return Path.Combine(Application.persistentDataPath, "VidowTools");
+                }
+            }
+            catch
+            {
+                // Application.persistentDataPath is only available inside Unity.
+            }
+
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Vidow", "VidowTools");
         }
 
         private static string GetPathExecutableName()
