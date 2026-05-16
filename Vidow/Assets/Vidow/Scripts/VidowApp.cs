@@ -43,6 +43,8 @@ namespace Vidow
         private const int ResolveTimeoutSeconds = 120;
         private const int RequestTimeoutSeconds = 15;
         private const int MaxConcurrentDownloads = 2;
+        private const int AppWindowWidth = 560;
+        private const int AppWindowHeight = 720;
         private const string BrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36";
         private const string ProxyUrlPrefKey = "Vidow.ProxyUrl";
         private const string BrowserCookiesPrefKey = "Vidow.BrowserCookies";
@@ -111,7 +113,7 @@ namespace Vidow
 
             if (!Application.isEditor)
             {
-                Screen.SetResolution(560, 720, false);
+                ApplyFixedWindowMode();
             }
 
             _lastDirectory = PlayerPrefs.GetString("Vidow.LastDownloadDirectory", GetDefaultDownloadDirectory());
@@ -130,6 +132,12 @@ namespace Vidow
             SetInlineMessage(string.Empty, TextMuted);
             UpdateFooterPath();
             StartCoroutine(FocusUrlInputNextFrame());
+        }
+
+        private static void ApplyFixedWindowMode()
+        {
+            Screen.fullScreenMode = FullScreenMode.Windowed;
+            Screen.SetResolution(AppWindowWidth, AppWindowHeight, false);
         }
 
         private void Update()
@@ -244,9 +252,11 @@ namespace Vidow
             layout.childForceExpandHeight = false;
 
             var logo = CreateRect("Logo", header);
-            AddLayoutElement(logo.gameObject, 42, 42);
+            AddLayoutElement(logo.gameObject, 48, 48);
             var logoImage = AddImage(logo.gameObject, Color.white);
             logoImage.sprite = _logoSprite;
+            logoImage.type = Image.Type.Simple;
+            logoImage.preserveAspect = true;
 
             var titleGroup = CreateRect("Title Group", header);
             AddLayoutElement(titleGroup.gameObject, -1, 52, 1);
@@ -3787,7 +3797,7 @@ namespace Vidow
 
         public static Sprite CreateLogo()
         {
-            const int size = 128;
+            const int size = 192;
             var tex = new Texture2D(size, size, TextureFormat.RGBA32, false);
             for (var y = 0; y < size; y++)
             {
@@ -3797,21 +3807,44 @@ namespace Vidow
                 }
             }
 
-            var center = new Vector2(64, 64);
+            var center = new Vector2(size * 0.5f, size * 0.5f);
+            var shadowCenter = center + new Vector2(0, -7);
             for (var y = 0; y < size; y++)
             {
                 for (var x = 0; x < size; x++)
                 {
-                    var distance = Vector2.Distance(new Vector2(x, y), center);
-                    if (distance <= 52)
+                    var p = new Vector2(x + 0.5f, y + 0.5f);
+                    var shadowDistance = Vector2.Distance(p, shadowCenter);
+                    if (shadowDistance <= 84)
                     {
-                        var t = Mathf.Clamp01(distance / 52f);
-                        tex.SetPixel(x, y, Color.Lerp(new Color(0.21f, 0.76f, 1f, 1), new Color(0.26f, 0.82f, 0.48f, 1), t));
+                        var shadowAlpha = Mathf.Clamp01((84 - shadowDistance) / 14f) * 0.26f;
+                        tex.SetPixel(x, y, new Color(0, 0, 0, shadowAlpha));
                     }
+
+                    var distance = Vector2.Distance(p, center);
+                    var edgeAlpha = Mathf.Clamp01(78.5f - distance);
+                    if (edgeAlpha <= 0)
+                    {
+                        continue;
+                    }
+
+                    var gradient = Mathf.Clamp01((x + y) / (float)(size * 2));
+                    var rim = Color.Lerp(new Color(0.14f, 0.76f, 1f, 1), new Color(0.25f, 0.86f, 0.48f, 1), gradient);
+                    var inner = Color.Lerp(new Color(0.07f, 0.13f, 0.16f, 1), new Color(0.10f, 0.18f, 0.20f, 1), y / (float)size);
+                    var fill = distance < 57 ? inner : Color.Lerp(rim, new Color(0.13f, 0.25f, 0.27f, 1), Mathf.InverseLerp(57, 78, distance));
+
+                    if (distance < 69 && y > center.y + 18)
+                    {
+                        fill = Color.Lerp(fill, Color.white, 0.10f);
+                    }
+
+                    fill.a = edgeAlpha;
+                    tex.SetPixel(x, y, fill);
                 }
             }
 
-            DrawTriangle(tex, new Vector2(54, 42), new Vector2(54, 86), new Vector2(88, 64), Color.white);
+            DrawTriangle(tex, new Vector2(82, 61), new Vector2(82, 131), new Vector2(136, 96), new Color(0.88f, 0.98f, 1f, 1));
+            DrawTriangle(tex, new Vector2(90, 76), new Vector2(90, 116), new Vector2(121, 96), new Color(0.21f, 0.76f, 1f, 1));
             tex.Apply();
             return Sprite.Create(tex, new Rect(0, 0, size, size), new Vector2(0.5f, 0.5f), 100);
         }

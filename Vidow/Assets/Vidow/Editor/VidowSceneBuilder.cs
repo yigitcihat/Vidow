@@ -248,9 +248,12 @@ namespace Vidow.EditorTools
             layout.childControlWidth = false;
             layout.childControlHeight = true;
 
-            var logo = Rect("Logo", header, new Vector2(42, 42));
-            Paint(logo.gameObject, Color.white).sprite = LoadSprite(LogoPath);
-            Layout(logo.gameObject, 42, 42);
+            var logo = Rect("Logo", header, new Vector2(48, 48));
+            var logoImage = Paint(logo.gameObject, Color.white);
+            logoImage.sprite = LoadSprite(LogoPath);
+            logoImage.type = Image.Type.Simple;
+            logoImage.preserveAspect = true;
+            Layout(logo.gameObject, 48, 48);
 
             var titleColumn = Rect("Title Group", header, new Vector2(420, 52));
             Layout(titleColumn.gameObject, -1, 52, 1);
@@ -471,21 +474,44 @@ namespace Vidow.EditorTools
         {
             var tex = ClearTexture(size, size);
             var center = new Vector2(size / 2f, size / 2f);
-            var radius = size * 0.42f;
+            var shadowCenter = center + new Vector2(0, -size * 0.04f);
+            var radius = size * 0.41f;
             for (var y = 0; y < size; y++)
             {
                 for (var x = 0; x < size; x++)
                 {
-                    var distance = Vector2.Distance(new Vector2(x, y), center);
-                    if (distance <= radius)
+                    var p = new Vector2(x + 0.5f, y + 0.5f);
+                    var shadowDistance = Vector2.Distance(p, shadowCenter);
+                    if (shadowDistance <= size * 0.44f)
                     {
-                        var t = Mathf.Clamp01(distance / radius);
-                        tex.SetPixel(x, y, Color.Lerp(Accent, Success, t));
+                        var shadowAlpha = Mathf.Clamp01((size * 0.44f - shadowDistance) / (size * 0.08f)) * 0.26f;
+                        tex.SetPixel(x, y, new Color(0, 0, 0, shadowAlpha));
                     }
+
+                    var distance = Vector2.Distance(p, center);
+                    var edgeAlpha = Mathf.Clamp01(radius + 0.5f - distance);
+                    if (edgeAlpha <= 0)
+                    {
+                        continue;
+                    }
+
+                    var gradient = Mathf.Clamp01((x + y) / (float)(size * 2));
+                    var rim = Color.Lerp(Accent, Success, gradient);
+                    var inner = Color.Lerp(new Color(0.07f, 0.13f, 0.16f, 1), new Color(0.10f, 0.18f, 0.20f, 1), y / (float)size);
+                    var fill = distance < size * 0.30f ? inner : Color.Lerp(rim, new Color(0.13f, 0.25f, 0.27f, 1), Mathf.InverseLerp(size * 0.30f, radius, distance));
+
+                    if (distance < size * 0.36f && y > center.y + size * 0.09f)
+                    {
+                        fill = Color.Lerp(fill, Color.white, 0.10f);
+                    }
+
+                    fill.a = edgeAlpha;
+                    tex.SetPixel(x, y, fill);
                 }
             }
 
-            DrawTriangle(tex, new Vector2(size * 0.42f, size * 0.34f), new Vector2(size * 0.42f, size * 0.66f), new Vector2(size * 0.70f, size * 0.50f), Color.white);
+            DrawTriangle(tex, new Vector2(size * 0.43f, size * 0.32f), new Vector2(size * 0.43f, size * 0.68f), new Vector2(size * 0.71f, size * 0.50f), new Color(0.88f, 0.98f, 1f, 1));
+            DrawTriangle(tex, new Vector2(size * 0.47f, size * 0.40f), new Vector2(size * 0.47f, size * 0.60f), new Vector2(size * 0.63f, size * 0.50f), Accent);
             tex.Apply();
             return tex;
         }
