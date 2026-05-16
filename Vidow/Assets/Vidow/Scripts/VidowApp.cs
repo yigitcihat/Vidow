@@ -1093,10 +1093,32 @@ namespace Vidow
                 yield break;
             }
 
+            string ffmpegLocation = null;
+            if (job.Video.RequiresExternalMuxer)
+            {
+                SetInlineMessage("Preparing FFmpeg for high-quality merge...", Warning);
+                ExternalToolResult ffmpeg = null;
+                yield return StartCoroutine(FfmpegBridge.EnsureAvailable(result => ffmpeg = result));
+
+                if (job.CancelRequested)
+                {
+                    CancelJob(job);
+                    yield break;
+                }
+
+                if (ffmpeg == null || !ffmpeg.Available)
+                {
+                    FailJob(job, "FFmpeg is required for this quality but could not be installed.", ffmpeg?.Message);
+                    yield break;
+                }
+
+                ffmpegLocation = FfmpegBridge.GetLocationArgument(ffmpeg.ExecutablePath);
+            }
+
             ExternalProcessRun run;
             try
             {
-                run = YtDlpBridge.StartDownload(tool.ExecutablePath, job.Video, job.TempFilePath);
+                run = YtDlpBridge.StartDownload(tool.ExecutablePath, job.Video, job.TempFilePath, ffmpegLocation);
             }
             catch (Exception ex)
             {
@@ -1131,13 +1153,14 @@ namespace Vidow
                 yield break;
             }
 
-            if (!File.Exists(job.TempFilePath))
+            var externalOutputPath = ResolveExternalOutputPath(job.TempFilePath, run);
+            if (string.IsNullOrWhiteSpace(externalOutputPath))
             {
                 FailJob(job, ExternalDownloadFailureMessage(run.ErrorTail, "The external downloader finished but did not create a video file."), run.ErrorTail);
                 yield break;
             }
 
-            CompleteDownloadedFile(job);
+            CompleteDownloadedFile(job, externalOutputPath);
         }
 
         private IEnumerator DownloadHlsRoutine(DownloadJob job, float startTime, long lastBytes, float lastSample)
@@ -1386,6 +1409,46 @@ namespace Vidow
             return 0;
         }
 
+        private static string ResolveExternalOutputPath(string requestedOutputPath, ExternalProcessRun run)
+        {
+            if (File.Exists(requestedOutputPath))
+            {
+                return requestedOutputPath;
+            }
+
+            var log = ((run?.StandardOutput ?? string.Empty) + "\n" + (run?.StandardError ?? string.Empty)).Trim();
+            foreach (Match match in Regex.Matches(log, "(?:Destination:|Merging formats into)\\s+\"(?<path>[^\"]+)\"", RegexOptions.IgnoreCase))
+            {
+                var path = match.Groups["path"].Value;
+                if (File.Exists(path))
+                {
+                    return path;
+                }
+            }
+
+            try
+            {
+                var directory = Path.GetDirectoryName(requestedOutputPath);
+                if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
+                {
+                    return null;
+                }
+
+                var requestedName = Path.GetFileName(requestedOutputPath);
+                var requestedBaseName = Path.GetFileNameWithoutExtension(requestedOutputPath);
+                return Directory.GetFiles(directory, requestedName + ".*")
+                    .Concat(Directory.GetFiles(directory, requestedBaseName + ".*"))
+                    .Where(path => !path.EndsWith(".part", StringComparison.OrdinalIgnoreCase))
+                    .Where(path => new FileInfo(path).Length > 0)
+                    .OrderByDescending(path => File.GetLastWriteTimeUtc(path))
+                    .FirstOrDefault();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
         private static string ExternalDownloadFailureMessage(string details, string fallback = "The external downloader failed for this source.")
         {
             details = Regex.Replace(details ?? string.Empty, "\\s+", " ").Trim();
@@ -1398,7 +1461,7 @@ namespace Vidow
                 details.IndexOf("ffprobe", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 details.IndexOf("merg", StringComparison.OrdinalIgnoreCase) >= 0)
             {
-                return "FFmpeg is required for this format. Try a lower MP4 quality or add FFmpeg support.";
+                return "FFmpeg could not finish the merge for this format. Try again or choose a ready MP4 option.";
             }
 
             if (details.IndexOf("permission", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -1424,16 +1487,17 @@ namespace Vidow
             return details.Length > 150 ? details.Substring(0, 150) + "..." : details;
         }
 
-        private void CompleteDownloadedFile(DownloadJob job)
+        private void CompleteDownloadedFile(DownloadJob job, string sourceFilePath = null)
         {
             try
             {
+                var sourcePath = string.IsNullOrWhiteSpace(sourceFilePath) ? job.TempFilePath : sourceFilePath;
                 if (File.Exists(job.FinalFilePath))
                 {
                     File.Delete(job.FinalFilePath);
                 }
 
-                File.Move(job.TempFilePath, job.FinalFilePath);
+                File.Move(sourcePath, job.FinalFilePath);
                 job.Status = DownloadStatus.Completed;
                 job.Progress.Percent = 1f;
                 job.View?.SetCompleted(job.FinalFilePath);

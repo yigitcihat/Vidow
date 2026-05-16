@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -182,6 +183,324 @@ namespace Vidow
         }
     }
 
+    public static class FfmpegBridge
+    {
+        private const string WindowsZipDownloadUrl = "https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip";
+        private const string InstallFolderName = "FFmpeg";
+
+        public static IEnumerator EnsureAvailable(Action<ExternalToolResult> complete)
+        {
+            var localExecutable = GetLocalExecutablePath();
+            if (TryProbe(localExecutable, out var localVersion))
+            {
+                complete(new ExternalToolResult
+                {
+                    Available = true,
+                    ExecutablePath = localExecutable,
+                    Version = localVersion,
+                    Message = "FFmpeg ready"
+                });
+                yield break;
+            }
+
+            if (TryProbe(GetPathExecutableName(), out var pathVersion))
+            {
+                complete(new ExternalToolResult
+                {
+                    Available = true,
+                    ExecutablePath = GetPathExecutableName(),
+                    Version = pathVersion,
+                    Message = "FFmpeg ready"
+                });
+                yield break;
+            }
+
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                complete(new ExternalToolResult
+                {
+                    Available = false,
+                    Message = "Install FFmpeg and make it available on PATH for merged high-quality downloads."
+                });
+                yield break;
+            }
+
+            var root = GetToolRootDirectory();
+            var zipPath = Path.Combine(root, "ffmpeg.zip.download");
+            var stagingDirectory = Path.Combine(root, "FFmpegDownload-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+
+            TryDeleteFile(zipPath);
+            TryDeleteDirectory(stagingDirectory);
+
+            using (var request = UnityWebRequest.Get(WindowsZipDownloadUrl))
+            {
+                request.timeout = 0;
+                request.downloadHandler = new DownloadHandlerFile(zipPath);
+                yield return request.SendWebRequest();
+
+                if (request.result != UnityWebRequest.Result.Success)
+                {
+                    complete(new ExternalToolResult
+                    {
+                        Available = false,
+                        Message = "Could not download FFmpeg: " + request.error
+                    });
+                    yield break;
+                }
+            }
+
+            string installError;
+            if (!TryInstallFromZip(zipPath, stagingDirectory, out installError))
+            {
+                TryDeleteFile(zipPath);
+                TryDeleteDirectory(stagingDirectory);
+                complete(new ExternalToolResult
+                {
+                    Available = false,
+                    Message = "Could not install FFmpeg: " + installError
+                });
+                yield break;
+            }
+
+            TryDeleteFile(zipPath);
+            TryDeleteDirectory(stagingDirectory);
+
+            localExecutable = GetLocalExecutablePath();
+            complete(new ExternalToolResult
+            {
+                Available = TryProbe(localExecutable, out var installedVersion),
+                ExecutablePath = localExecutable,
+                Version = installedVersion,
+                Message = string.IsNullOrWhiteSpace(installedVersion) ? "FFmpeg was installed but did not start." : "FFmpeg installed"
+            });
+        }
+
+        public static string GetLocationArgument(string executablePath)
+        {
+            if (string.IsNullOrWhiteSpace(executablePath) || !Path.IsPathRooted(executablePath))
+            {
+                return null;
+            }
+
+            return Path.GetDirectoryName(executablePath);
+        }
+
+        private static bool TryInstallFromZip(string zipPath, string stagingDirectory, out string error)
+        {
+            error = null;
+            try
+            {
+                Directory.CreateDirectory(stagingDirectory);
+                ExtractZipFile(zipPath, stagingDirectory);
+
+                var ffmpegPath = Directory.GetFiles(stagingDirectory, "ffmpeg.exe", SearchOption.AllDirectories).FirstOrDefault();
+                var ffprobePath = Directory.GetFiles(stagingDirectory, "ffprobe.exe", SearchOption.AllDirectories).FirstOrDefault();
+                if (string.IsNullOrWhiteSpace(ffmpegPath) || string.IsNullOrWhiteSpace(ffprobePath))
+                {
+                    error = "The FFmpeg archive did not contain ffmpeg.exe and ffprobe.exe.";
+                    return false;
+                }
+
+                var sourceBinDirectory = Path.GetDirectoryName(ffmpegPath);
+                var installDirectory = GetLocalInstallDirectory();
+                TryDeleteDirectory(installDirectory);
+                Directory.CreateDirectory(installDirectory);
+
+                foreach (var file in Directory.GetFiles(sourceBinDirectory))
+                {
+                    File.Copy(file, Path.Combine(installDirectory, Path.GetFileName(file)), true);
+                }
+
+                return File.Exists(Path.Combine(installDirectory, "ffmpeg.exe")) &&
+                       File.Exists(Path.Combine(installDirectory, "ffprobe.exe"));
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        private static void ExtractZipFile(string zipPath, string destinationDirectory)
+        {
+            var destinationRoot = Path.GetFullPath(destinationDirectory);
+            if (!destinationRoot.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal))
+            {
+                destinationRoot += Path.DirectorySeparatorChar;
+            }
+
+            using (var stream = new FileStream(zipPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (var archive = new ZipArchive(stream, ZipArchiveMode.Read))
+            {
+                foreach (var entry in archive.Entries)
+                {
+                    var entryPath = Path.GetFullPath(Path.Combine(destinationDirectory, entry.FullName));
+                    if (!entryPath.StartsWith(destinationRoot, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidDataException("The FFmpeg archive contains an invalid path.");
+                    }
+
+                    if (string.IsNullOrWhiteSpace(entry.Name))
+                    {
+                        Directory.CreateDirectory(entryPath);
+                        continue;
+                    }
+
+                    Directory.CreateDirectory(Path.GetDirectoryName(entryPath));
+                    using (var source = entry.Open())
+                    using (var target = new FileStream(entryPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                    {
+                        source.CopyTo(target);
+                    }
+                }
+            }
+        }
+
+        private static bool TryProbe(string executablePath, out string version)
+        {
+            version = null;
+            if (string.IsNullOrWhiteSpace(executablePath))
+            {
+                return false;
+            }
+
+            try
+            {
+                if (Path.IsPathRooted(executablePath) && !File.Exists(executablePath))
+                {
+                    return false;
+                }
+
+                var info = new ProcessStartInfo
+                {
+                    FileName = executablePath,
+                    Arguments = "-version",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+
+                using (var process = Process.Start(info))
+                {
+                    if (process == null)
+                    {
+                        return false;
+                    }
+
+                    if (!process.WaitForExit(4000))
+                    {
+                        TryKill(process);
+                        return false;
+                    }
+
+                    var output = process.StandardOutput.ReadToEnd().Trim();
+                    var firstLine = Regex.Split(output, "\\r?\\n").FirstOrDefault();
+                    version = string.IsNullOrWhiteSpace(firstLine) ? output : firstLine.Trim();
+                    return process.ExitCode == 0 && !string.IsNullOrWhiteSpace(version);
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string GetLocalExecutablePath()
+        {
+            var primary = Path.Combine(GetLocalInstallDirectory(), "ffmpeg.exe");
+            if (File.Exists(primary))
+            {
+                return primary;
+            }
+
+            try
+            {
+                var installDirectory = GetLocalInstallDirectory();
+                return Directory.Exists(installDirectory)
+                    ? Directory.GetFiles(installDirectory, "ffmpeg.exe", SearchOption.AllDirectories).FirstOrDefault() ?? primary
+                    : primary;
+            }
+            catch
+            {
+                return primary;
+            }
+        }
+
+        private static string GetLocalInstallDirectory()
+        {
+            return Path.Combine(GetToolRootDirectory(), InstallFolderName);
+        }
+
+        private static string GetToolRootDirectory()
+        {
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(Application.persistentDataPath))
+                {
+                    return Path.Combine(Application.persistentDataPath, "VidowTools");
+                }
+            }
+            catch
+            {
+                // Application.persistentDataPath is only available inside Unity.
+            }
+
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Vidow", "VidowTools");
+        }
+
+        private static string GetPathExecutableName()
+        {
+            return RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "ffmpeg.exe" : "ffmpeg";
+        }
+
+        private static void TryDeleteFile(string path)
+        {
+            try
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+            catch
+            {
+                // Best-effort cleanup.
+            }
+        }
+
+        private static void TryDeleteDirectory(string path)
+        {
+            try
+            {
+                if (Directory.Exists(path))
+                {
+                    Directory.Delete(path, true);
+                }
+            }
+            catch
+            {
+                // Best-effort cleanup.
+            }
+        }
+
+        private static void TryKill(Process process)
+        {
+            try
+            {
+                if (process != null && !process.HasExited)
+                {
+                    process.Kill();
+                }
+            }
+            catch
+            {
+                // Best-effort cleanup.
+            }
+        }
+    }
+
     public static class YtDlpBridge
     {
         private const string WindowsDownloadUrl = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
@@ -298,12 +617,12 @@ namespace Vidow
             }, toolDirectory, CreateToolEnvironment(executablePath));
         }
 
-        public static ExternalProcessRun StartDownload(string executablePath, VideoItem video, string outputPath)
+        public static ExternalProcessRun StartDownload(string executablePath, VideoItem video, string outputPath, string ffmpegLocation = null)
         {
             var format = string.IsNullOrWhiteSpace(video.ExternalFormatSelector) ? DefaultFormatSelector : video.ExternalFormatSelector;
             var toolDirectory = GetToolDirectory(executablePath);
             var tempDirectory = GetToolTempDirectory(executablePath);
-            return ExternalProcessRun.Start(executablePath, new[]
+            var arguments = new List<string>
             {
                 "--newline",
                 "--no-warnings",
@@ -311,13 +630,31 @@ namespace Vidow
                 "--no-mtime",
                 "--force-overwrites",
                 "--paths",
-                "temp:" + tempDirectory,
+                "temp:" + tempDirectory
+            };
+
+            if (!string.IsNullOrWhiteSpace(ffmpegLocation))
+            {
+                arguments.Add("--ffmpeg-location");
+                arguments.Add(ffmpegLocation);
+            }
+
+            if (video.RequiresExternalMuxer)
+            {
+                arguments.Add("--merge-output-format");
+                arguments.Add("mp4");
+            }
+
+            arguments.AddRange(new[]
+            {
                 "-f",
                 format,
                 "-o",
                 outputPath,
                 string.IsNullOrWhiteSpace(video.ExternalSourceUrl) ? video.PageUrl : video.ExternalSourceUrl
-            }, toolDirectory, CreateToolEnvironment(executablePath));
+            });
+
+            return ExternalProcessRun.Start(executablePath, arguments, toolDirectory, CreateToolEnvironment(executablePath));
         }
 
         public static string GetStagingFilePath(string finalFilePath)
@@ -330,7 +667,7 @@ namespace Vidow
                 fileName = "download.mp4";
             }
 
-            return Path.Combine(stagingDirectory, Guid.NewGuid().ToString("N") + "-" + fileName + ".part");
+            return Path.Combine(stagingDirectory, Guid.NewGuid().ToString("N") + "-" + fileName);
         }
 
         public static List<VideoItem> ParseVideoItems(string json, string originalUrl)
