@@ -1464,6 +1464,17 @@ namespace Vidow
                 return "FFmpeg could not finish the merge for this format. Try again or choose a ready MP4 option.";
             }
 
+            if (details.IndexOf("WinError 10061", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                details.IndexOf("failed to establish a new connection", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                details.IndexOf("failed to connect", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                details.IndexOf("could not connect to server", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                details.IndexOf("connection refused", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                details.IndexOf("actively refused", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                details.IndexOf("etkin olarak reddetti", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return "The video was found, but the source CDN refused the connection from this network.";
+            }
+
             if (details.IndexOf("permission", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 details.IndexOf("access is denied", StringComparison.OrdinalIgnoreCase) >= 0)
             {
