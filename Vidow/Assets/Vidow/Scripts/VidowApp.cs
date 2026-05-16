@@ -1977,8 +1977,8 @@ namespace Vidow
 
             public void SetReady()
             {
-                _status.text = Item.IsDownloadable ? "Ready" : "Unsupported";
-                _status.color = Item.IsDownloadable ? Success : Warning;
+                _status.text = Item.RequiresExternalMuxer ? "Merge" : Item.IsDownloadable ? "Ready" : "Unsupported";
+                _status.color = Item.RequiresExternalMuxer ? Warning : Item.IsDownloadable ? Success : Warning;
                 _primaryButton.interactable = Item.IsDownloadable;
                 _primaryButtonText.text = Item.IsDownloadable ? "Download" : "N/A";
                 _secondaryButton.gameObject.SetActive(false);
@@ -2111,6 +2111,7 @@ namespace Vidow
         public TimeSpan? Duration;
         public bool IsHls;
         public bool IsExternal;
+        public bool RequiresExternalMuxer;
         public bool IsDownloadable = true;
         public string UnsupportedReason;
         public Dictionary<string, string> RequestHeaders = new Dictionary<string, string>();
@@ -2127,6 +2128,7 @@ namespace Vidow
                 var parts = new List<string>();
                 if (!string.IsNullOrWhiteSpace(SourceDomain)) parts.Add(SourceDomain);
                 if (!string.IsNullOrWhiteSpace(ExternalToolName)) parts.Add(ExternalToolName);
+                if (RequiresExternalMuxer) parts.Add("Needs FFmpeg");
                 if (Duration.HasValue) parts.Add(TimeFormatter.Format(Duration.Value));
                 if (!string.IsNullOrWhiteSpace(Extension)) parts.Add(Extension.TrimStart('.').ToUpperInvariant());
                 if (!string.IsNullOrWhiteSpace(QualityLabel)) parts.Add(QualityLabel);

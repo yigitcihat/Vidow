@@ -373,7 +373,8 @@ namespace Vidow
                 };
             }
 
-            var candidates = new List<VideoItem>();
+            var combinedCandidates = new List<VideoItem>();
+            var muxedCandidates = new List<VideoItem>();
             foreach (var entry in formats)
             {
                 var format = entry as Dictionary<string, object>;
@@ -390,8 +391,7 @@ namespace Vidow
 
                 var vcodec = GetString(format, "vcodec");
                 var acodec = GetString(format, "acodec");
-                if (string.Equals(vcodec, "none", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(acodec, "none", StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(vcodec, "none", StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }
@@ -404,39 +404,62 @@ namespace Vidow
                 }
 
                 var height = GetInt(format, "height");
+                if (!height.HasValue || height.Value <= 0)
+                {
+                    continue;
+                }
+
                 var quality = BuildQualityLabel(format, height);
                 var fileSize = GetLong(format, "filesize") ?? GetLong(format, "filesize_approx");
+                var requiresMuxer = string.Equals(acodec, "none", StringComparison.OrdinalIgnoreCase);
+                var selector = requiresMuxer
+                    ? BuildMuxedSelector(formatId)
+                    : formatId;
+                var displayQuality = requiresMuxer ? quality + " + audio" : quality;
                 var item = new VideoItem
                 {
                     Id = Guid.NewGuid().ToString("N"),
                     PageUrl = pageUrl,
-                    MediaUrl = "external://" + formatId,
-                    Title = AppendQuality(title, quality),
+                    MediaUrl = "external://" + selector,
+                    Title = AppendQuality(title, displayQuality),
                     SourceDomain = extractor,
                     ThumbnailUrl = thumbnail,
                     Extension = extension,
                     MimeType = GetString(format, "mime_type"),
-                    QualityLabel = quality,
+                    QualityLabel = displayQuality,
                     SizeBytes = fileSize,
                     Duration = durationValue,
                     IsExternal = true,
+                    RequiresExternalMuxer = requiresMuxer,
                     ExternalSourceUrl = pageUrl,
-                    ExternalFormatSelector = formatId,
+                    ExternalFormatSelector = selector,
                     ExternalToolName = "yt-dlp"
                 };
 
-                candidates.Add(item);
+                if (requiresMuxer)
+                {
+                    muxedCandidates.Add(item);
+                }
+                else
+                {
+                    combinedCandidates.Add(item);
+                }
             }
 
-            var selected = candidates
-                .GroupBy(item => QualityKey(item), StringComparer.OrdinalIgnoreCase)
-                .Select(group => group
-                    .OrderByDescending(item => item.Extension.Equals("mp4", StringComparison.OrdinalIgnoreCase))
-                    .ThenByDescending(item => item.SizeBytes ?? 0)
-                    .First())
+            var selectedCombined = SelectBestPerHeight(combinedCandidates)
+                .Take(6)
+                .ToList();
+            var selectedMuxed = SelectBestPerHeight(muxedCandidates)
+                .Where(item => !selectedCombined.Any(existing => QualityHeight(existing) == QualityHeight(item)))
+                .Take(4)
+                .ToList();
+
+            var selected = selectedMuxed
+                .Concat(selectedCombined)
                 .OrderByDescending(item => HlsPlaylistParser.QualityRank(item.QualityLabel))
+                .ThenBy(item => item.RequiresExternalMuxer)
                 .ThenByDescending(item => item.Extension.Equals("mp4", StringComparison.OrdinalIgnoreCase))
-                .Take(8)
+                .Take(10)
                 .ToList();
 
             if (selected.Count == 0)
@@ -445,6 +468,18 @@ namespace Vidow
             }
 
             return selected;
+        }
+
+        private static IEnumerable<VideoItem> SelectBestPerHeight(IEnumerable<VideoItem> items)
+        {
+            return items
+                .GroupBy(item => QualityHeight(item))
+                .Where(group => group.Key > 0)
+                .Select(group => group
+                    .OrderByDescending(item => item.Extension.Equals("mp4", StringComparison.OrdinalIgnoreCase))
+                    .ThenByDescending(item => item.SizeBytes ?? 0)
+                    .First())
+                .OrderByDescending(item => QualityHeight(item));
         }
 
         private static List<VideoItem> ParsePlaylistEntries(List<object> entries, string originalUrl)
@@ -527,6 +562,16 @@ namespace Vidow
         {
             var rank = HlsPlaylistParser.QualityRank(item.QualityLabel);
             return rank > 0 ? rank + "-" + item.Extension : item.QualityLabel + "-" + item.Extension;
+        }
+
+        private static int QualityHeight(VideoItem item)
+        {
+            return HlsPlaylistParser.QualityRank(item.QualityLabel);
+        }
+
+        private static string BuildMuxedSelector(string videoFormatId)
+        {
+            return $"{videoFormatId}+bestaudio[ext=m4a]/{videoFormatId}+bestaudio/best";
         }
 
         private static string AppendQuality(string title, string quality)
