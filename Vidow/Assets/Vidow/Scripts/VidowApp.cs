@@ -40,7 +40,7 @@ namespace Vidow
 
     public sealed class VidowApp : MonoBehaviour
     {
-        private const int ResolveTimeoutSeconds = 20;
+        private const int ResolveTimeoutSeconds = 120;
         private const int RequestTimeoutSeconds = 15;
         private const int MaxConcurrentDownloads = 2;
         private const string BrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36";
@@ -638,33 +638,99 @@ namespace Vidow
                 TrySetRequestHeader(request, "User-Agent", BrowserUserAgent);
                 yield return request.SendWebRequest();
 
+                ResolveResult fallback;
                 if (request.result == UnityWebRequest.Result.ConnectionError)
                 {
-                    complete(ResolveResult.Fail(ResolveStatus.NetworkError, "Could not reach this link. Check your connection and try again."));
-                    yield break;
+                    fallback = ResolveResult.Fail(ResolveStatus.NetworkError, "Could not reach this link. Check your connection and try again.");
                 }
-
-                if (request.result != UnityWebRequest.Result.Success)
+                else if (request.result != UnityWebRequest.Result.Success)
                 {
-                    complete(ResolveResult.Fail(ResolveStatus.UnsupportedSource, "This source is not supported for download."));
-                    yield break;
+                    fallback = ResolveResult.Fail(ResolveStatus.UnsupportedSource, "This source is not supported for download.");
                 }
-
-                var html = request.downloadHandler.text;
-                var videos = HtmlVideoParser.Extract(uri, html).ToList();
-                if (videos.Count == 0)
+                else
                 {
-                    complete(ResolveResult.Fail(ResolveStatus.NoVideosFound, "No downloadable videos were found."));
+                    var html = request.downloadHandler.text;
+                    var videos = HtmlVideoParser.Extract(uri, html).ToList();
+                    if (videos.Count > 0)
+                    {
+                        complete(new ResolveResult
+                        {
+                            Status = ResolveStatus.Success,
+                            Videos = videos,
+                            UserMessage = string.Empty
+                        });
+                        yield break;
+                    }
+
+                    fallback = ResolveResult.Fail(ResolveStatus.NoVideosFound, "No downloadable videos were found.");
+                }
+
+                SetStatus("Checking extended sources...");
+                yield return StartCoroutine(ResolveExternalVideos(uri, fallback, complete));
+            }
+        }
+
+        private IEnumerator ResolveExternalVideos(Uri uri, ResolveResult fallback, Action<ResolveResult> complete)
+        {
+            SetInlineMessage("Preparing YouTube and extended-site support...", TextMuted);
+            ExternalToolResult tool = null;
+            yield return StartCoroutine(YtDlpBridge.EnsureAvailable(result => tool = result));
+
+            if (tool == null || !tool.Available)
+            {
+                complete(ResolveResult.Fail(
+                    ResolveStatus.UnsupportedSource,
+                    tool == null || string.IsNullOrWhiteSpace(tool.Message)
+                        ? fallback.UserMessage
+                        : tool.Message));
+                yield break;
+            }
+
+            SetInlineMessage("Reading formats with yt-dlp...", TextMuted);
+            ExternalProcessRun run;
+            try
+            {
+                run = YtDlpBridge.StartMetadata(tool.ExecutablePath, uri.AbsoluteUri);
+            }
+            catch (Exception ex)
+            {
+                complete(ResolveResult.Fail(ResolveStatus.UnsupportedSource, "yt-dlp could not start: " + ex.Message));
+                yield break;
+            }
+
+            var deadline = Time.realtimeSinceStartup + 75f;
+            while (!run.IsDone)
+            {
+                if (Time.realtimeSinceStartup > deadline)
+                {
+                    run.Cancel();
+                    complete(ResolveResult.Fail(ResolveStatus.Timeout, "yt-dlp took too long to analyze this link."));
                     yield break;
                 }
 
-                complete(new ResolveResult
+                yield return null;
+            }
+
+            if (run.ExitCode != 0)
+            {
+                var message = string.IsNullOrWhiteSpace(run.ErrorTail) ? fallback.UserMessage : run.ErrorTail;
+                complete(ResolveResult.Fail(ResolveStatus.UnsupportedSource, message));
+                yield break;
+            }
+
+            var videos = YtDlpBridge.ParseVideoItems(run.StandardOutput, uri.AbsoluteUri);
+            if (videos.Count == 0)
+            {
+                complete(fallback ?? ResolveResult.Fail(ResolveStatus.NoVideosFound, "No downloadable videos were found."));
+                yield break;
+            }
+
+            complete(new ResolveResult
                 {
                     Status = ResolveStatus.Success,
                     Videos = videos,
                     UserMessage = string.Empty
                 });
-            }
         }
 
         private IEnumerator ResolveDailymotionVideos(Uri uri, Action<ResolveResult> complete)
@@ -971,6 +1037,12 @@ namespace Vidow
                 yield break;
             }
 
+            if (job.Video.IsExternal)
+            {
+                yield return StartCoroutine(DownloadExternalRoutine(job, startTime, lastBytes, lastSample));
+                yield break;
+            }
+
             using (var request = UnityWebRequest.Get(job.Video.MediaUrl))
             {
                 request.timeout = 0;
@@ -1004,6 +1076,64 @@ namespace Vidow
                     FailJob(job, "The download failed. Check your connection and try again.", request.error);
                     yield break;
                 }
+            }
+
+            CompleteDownloadedFile(job);
+        }
+
+        private IEnumerator DownloadExternalRoutine(DownloadJob job, float startTime, long lastBytes, float lastSample)
+        {
+            ExternalToolResult tool = null;
+            yield return StartCoroutine(YtDlpBridge.EnsureAvailable(result => tool = result));
+
+            if (tool == null || !tool.Available)
+            {
+                FailJob(job, "yt-dlp is required for this source but could not be installed.", tool?.Message);
+                yield break;
+            }
+
+            ExternalProcessRun run;
+            try
+            {
+                run = YtDlpBridge.StartDownload(tool.ExecutablePath, job.Video, job.TempFilePath);
+            }
+            catch (Exception ex)
+            {
+                FailJob(job, "yt-dlp could not start this download.", ex.Message);
+                yield break;
+            }
+
+            while (!run.IsDone)
+            {
+                if (job.CancelRequested)
+                {
+                    run.Cancel();
+                    CancelJob(job);
+                    yield break;
+                }
+
+                UpdateExternalDownloadProgress(job, run, ref lastBytes, ref lastSample);
+                yield return null;
+            }
+
+            UpdateExternalDownloadProgress(job, run, ref lastBytes, ref lastSample);
+
+            if (job.CancelRequested)
+            {
+                CancelJob(job);
+                yield break;
+            }
+
+            if (run.ExitCode != 0)
+            {
+                FailJob(job, "The external downloader failed for this source.", run.ErrorTail);
+                yield break;
+            }
+
+            if (!File.Exists(job.TempFilePath))
+            {
+                FailJob(job, "The external downloader finished but did not create a video file.", run.ErrorTail);
+                yield break;
             }
 
             CompleteDownloadedFile(job);
@@ -1202,6 +1332,59 @@ namespace Vidow
             job.View?.SetDownloading(job.Progress);
         }
 
+        private void UpdateExternalDownloadProgress(DownloadJob job, ExternalProcessRun run, ref long lastBytes, ref float lastSample)
+        {
+            var now = Time.realtimeSinceStartup;
+            var bytes = FindDownloadBytes(job.TempFilePath);
+
+            if (now - lastSample >= 0.25f)
+            {
+                var deltaBytes = bytes - lastBytes;
+                var deltaTime = Mathf.Max(0.01f, now - lastSample);
+                job.Progress.BytesPerSecond = Math.Max(0, deltaBytes / deltaTime);
+                lastBytes = bytes;
+                lastSample = now;
+            }
+
+            job.Progress.BytesDownloaded = Math.Max(0, bytes);
+            job.Progress.TotalBytes = job.Video.SizeBytes;
+            if (run != null && run.Percent.HasValue)
+            {
+                job.Progress.Percent = run.Percent.Value;
+            }
+            else
+            {
+                job.Progress.Percent = job.Video.SizeBytes.HasValue && job.Video.SizeBytes.Value > 0
+                    ? Mathf.Clamp01((float)bytes / job.Video.SizeBytes.Value)
+                    : (float?)null;
+            }
+
+            job.View?.SetDownloading(job.Progress);
+        }
+
+        private static long FindDownloadBytes(string tempFilePath)
+        {
+            try
+            {
+                if (File.Exists(tempFilePath))
+                {
+                    return new FileInfo(tempFilePath).Length;
+                }
+
+                var partPath = tempFilePath + ".part";
+                if (File.Exists(partPath))
+                {
+                    return new FileInfo(partPath).Length;
+                }
+            }
+            catch
+            {
+                return 0;
+            }
+
+            return 0;
+        }
+
         private void CompleteDownloadedFile(DownloadJob job)
         {
             try
@@ -1295,6 +1478,12 @@ namespace Vidow
                 if (File.Exists(job.TempFilePath))
                 {
                     File.Delete(job.TempFilePath);
+                }
+
+                var partPath = job.TempFilePath + ".part";
+                if (File.Exists(partPath))
+                {
+                    File.Delete(partPath);
                 }
             }
             catch
@@ -1882,9 +2071,13 @@ namespace Vidow
         public long? SizeBytes;
         public TimeSpan? Duration;
         public bool IsHls;
+        public bool IsExternal;
         public bool IsDownloadable = true;
         public string UnsupportedReason;
         public Dictionary<string, string> RequestHeaders = new Dictionary<string, string>();
+        public string ExternalSourceUrl;
+        public string ExternalFormatSelector;
+        public string ExternalToolName;
 
         public string SafeFileName => SafePath.SanitizeFileName($"{Title}.{(string.IsNullOrWhiteSpace(Extension) ? "mp4" : Extension.TrimStart('.'))}");
 
@@ -1894,6 +2087,7 @@ namespace Vidow
             {
                 var parts = new List<string>();
                 if (!string.IsNullOrWhiteSpace(SourceDomain)) parts.Add(SourceDomain);
+                if (!string.IsNullOrWhiteSpace(ExternalToolName)) parts.Add(ExternalToolName);
                 if (Duration.HasValue) parts.Add(TimeFormatter.Format(Duration.Value));
                 if (!string.IsNullOrWhiteSpace(Extension)) parts.Add(Extension.TrimStart('.').ToUpperInvariant());
                 if (!string.IsNullOrWhiteSpace(QualityLabel)) parts.Add(QualityLabel);
