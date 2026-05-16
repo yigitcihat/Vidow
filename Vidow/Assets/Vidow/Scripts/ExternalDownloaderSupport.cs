@@ -70,7 +70,7 @@ namespace Vidow
             }
         }
 
-        public static ExternalProcessRun Start(string fileName, IEnumerable<string> arguments, string workingDirectory = null)
+        public static ExternalProcessRun Start(string fileName, IEnumerable<string> arguments, string workingDirectory = null, IDictionary<string, string> environment = null)
         {
             var run = new ExternalProcessRun();
             var info = new ProcessStartInfo
@@ -86,6 +86,17 @@ namespace Vidow
             if (!string.IsNullOrWhiteSpace(workingDirectory))
             {
                 info.WorkingDirectory = workingDirectory;
+            }
+
+            if (environment != null)
+            {
+                foreach (var pair in environment)
+                {
+                    if (!string.IsNullOrWhiteSpace(pair.Key) && pair.Value != null)
+                    {
+                        info.EnvironmentVariables[pair.Key] = pair.Value;
+                    }
+                }
             }
 
             run._process = new Process
@@ -276,6 +287,7 @@ namespace Vidow
 
         public static ExternalProcessRun StartMetadata(string executablePath, string url)
         {
+            var toolDirectory = GetToolDirectory(executablePath);
             return ExternalProcessRun.Start(executablePath, new[]
             {
                 "--dump-single-json",
@@ -283,12 +295,13 @@ namespace Vidow
                 "--skip-download",
                 "--no-playlist",
                 url
-            });
+            }, toolDirectory, CreateToolEnvironment(executablePath));
         }
 
         public static ExternalProcessRun StartDownload(string executablePath, VideoItem video, string outputPath)
         {
             var format = string.IsNullOrWhiteSpace(video.ExternalFormatSelector) ? DefaultFormatSelector : video.ExternalFormatSelector;
+            var toolDirectory = GetToolDirectory(executablePath);
             return ExternalProcessRun.Start(executablePath, new[]
             {
                 "--newline",
@@ -301,7 +314,7 @@ namespace Vidow
                 "-o",
                 outputPath,
                 string.IsNullOrWhiteSpace(video.ExternalSourceUrl) ? video.PageUrl : video.ExternalSourceUrl
-            });
+            }, toolDirectory, CreateToolEnvironment(executablePath));
         }
 
         public static List<VideoItem> ParseVideoItems(string json, string originalUrl)
@@ -557,6 +570,17 @@ namespace Vidow
                     CreateNoWindow = true
                 };
 
+                foreach (var pair in CreateToolEnvironment(executablePath))
+                {
+                    info.EnvironmentVariables[pair.Key] = pair.Value;
+                }
+
+                var toolDirectory = GetToolDirectory(executablePath);
+                if (!string.IsNullOrWhiteSpace(toolDirectory))
+                {
+                    info.WorkingDirectory = toolDirectory;
+                }
+
                 using (var process = Process.Start(info))
                 {
                     if (process == null)
@@ -584,6 +608,29 @@ namespace Vidow
         {
             var name = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "yt-dlp.exe" : "yt-dlp";
             return Path.Combine(Application.persistentDataPath, "VidowTools", name);
+        }
+
+        private static string GetToolDirectory(string executablePath)
+        {
+            if (!string.IsNullOrWhiteSpace(executablePath) && Path.IsPathRooted(executablePath))
+            {
+                return Path.GetDirectoryName(executablePath);
+            }
+
+            return Path.Combine(Application.persistentDataPath, "VidowTools");
+        }
+
+        private static Dictionary<string, string> CreateToolEnvironment(string executablePath)
+        {
+            var tempDirectory = Path.Combine(GetToolDirectory(executablePath), "Temp");
+            Directory.CreateDirectory(tempDirectory);
+            return new Dictionary<string, string>
+            {
+                { "TEMP", tempDirectory },
+                { "TMP", tempDirectory },
+                { "TMPDIR", tempDirectory },
+                { "PYTHONUTF8", "1" }
+            };
         }
 
         private static string GetPathExecutableName()
