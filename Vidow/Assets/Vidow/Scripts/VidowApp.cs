@@ -44,6 +44,8 @@ namespace Vidow
         private const int RequestTimeoutSeconds = 15;
         private const int MaxConcurrentDownloads = 2;
         private const string BrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36";
+        private const string ProxyUrlPrefKey = "Vidow.ProxyUrl";
+        private const string BrowserCookiesPrefKey = "Vidow.BrowserCookies";
 
         private readonly List<VideoItem> _videos = new List<VideoItem>();
         private readonly List<ResultItemView> _resultViews = new List<ResultItemView>();
@@ -74,12 +76,18 @@ namespace Vidow
         private GameObject _modalOverlay;
         private TMP_InputField _pathInput;
         private TextMeshProUGUI _modalMessage;
+        private GameObject _networkModalOverlay;
+        private TMP_InputField _proxyInput;
+        private TMP_InputField _browserCookiesInput;
+        private TextMeshProUGUI _networkModalMessage;
         private TextMeshProUGUI _toastText;
         private CanvasGroup _toastGroup;
 
         private Coroutine _resolveRoutine;
         private Coroutine _toastRoutine;
         private string _lastDirectory;
+        private string _proxyUrl;
+        private string _browserCookies;
         private VideoItem _pendingFolderVideo;
         private float _lastNetworkProbeTime;
         private bool _networkReachable = true;
@@ -107,6 +115,8 @@ namespace Vidow
             }
 
             _lastDirectory = PlayerPrefs.GetString("Vidow.LastDownloadDirectory", GetDefaultDownloadDirectory());
+            _proxyUrl = PlayerPrefs.GetString(ProxyUrlPrefKey, string.Empty);
+            _browserCookies = PlayerPrefs.GetString(BrowserCookiesPrefKey, string.Empty);
             CreateSprites();
             EnsureEventSystem();
             var designPreview = GameObject.Find("Vidow Design Preview Canvas");
@@ -130,6 +140,10 @@ namespace Vidow
                 {
                     ConfirmFallbackPath();
                 }
+                else if (_networkModalOverlay != null && _networkModalOverlay.activeSelf)
+                {
+                    SaveNetworkSettings();
+                }
                 else
                 {
                     StartSearch();
@@ -141,6 +155,10 @@ namespace Vidow
                 if (_modalOverlay != null && _modalOverlay.activeSelf)
                 {
                     ClosePathModal();
+                }
+                else if (_networkModalOverlay != null && _networkModalOverlay.activeSelf)
+                {
+                    CloseNetworkModal();
                 }
                 else if (_resolveRoutine != null)
                 {
@@ -162,8 +180,7 @@ namespace Vidow
             {
                 _lastNetworkProbeTime = Time.unscaledTime;
                 _networkReachable = Application.internetReachability != NetworkReachability.NotReachable;
-                _networkStatusText.text = _networkReachable ? "Online" : "Offline";
-                _networkStatusText.color = _networkReachable ? Success : Warning;
+                UpdateNetworkStatusText();
             }
         }
 
@@ -210,6 +227,7 @@ namespace Vidow
             CreateResultsArea(main);
             CreateFooter(main);
             CreatePathModal(canvasGo.transform);
+            CreateNetworkModal(canvasGo.transform);
             CreateToast(canvasGo.transform);
         }
 
@@ -395,6 +413,10 @@ namespace Vidow
             _networkStatusText = CreateText("Online", footer, 11, FontStyles.Bold, Success);
             _networkStatusText.alignment = TextAlignmentOptions.Center;
             AddLayoutElement(_networkStatusText.gameObject, 70, 30);
+
+            var network = CreateButton(footer, "Net", "Network settings", SurfaceHover, TextSecondary, ShowNetworkModal);
+            AddLayoutElement(network.gameObject, 54, 30);
+            UpdateNetworkStatusText();
         }
 
         private GameObject CreateEmptyState(Transform parent)
@@ -495,6 +517,66 @@ namespace Vidow
             AddLayoutElement(cancel.gameObject, 94, 40);
             var choose = CreateButton(actions, "Choose", "Choose folder", Accent, Background, ConfirmFallbackPath);
             AddLayoutElement(choose.gameObject, 104, 40);
+        }
+
+        private void CreateNetworkModal(Transform parent)
+        {
+            _networkModalOverlay = CreateRect("Network Modal Overlay", parent).gameObject;
+            Stretch(_networkModalOverlay.GetComponent<RectTransform>());
+            AddImage(_networkModalOverlay, new Color(0, 0, 0, 0.64f));
+            _networkModalOverlay.SetActive(false);
+
+            var modal = CreateRect("Network Modal", _networkModalOverlay.transform);
+            modal.anchorMin = new Vector2(0.5f, 0.5f);
+            modal.anchorMax = new Vector2(0.5f, 0.5f);
+            modal.pivot = new Vector2(0.5f, 0.5f);
+            modal.sizeDelta = new Vector2(460, 330);
+            AddImage(modal.gameObject, Surface);
+            var layout = modal.gameObject.AddComponent<VerticalLayoutGroup>();
+            layout.padding = new RectOffset(18, 18, 18, 18);
+            layout.spacing = 9;
+            layout.childControlWidth = true;
+            layout.childControlHeight = true;
+            layout.childForceExpandWidth = true;
+            layout.childForceExpandHeight = false;
+
+            var title = CreateText("Network", modal, 18, FontStyles.Bold, TextPrimary);
+            title.alignment = TextAlignmentOptions.Left;
+            AddLayoutElement(title.gameObject, -1, 28);
+
+            _networkModalMessage = CreateText("yt-dlp network settings", modal, 12, FontStyles.Normal, TextSecondary);
+            _networkModalMessage.textWrappingMode = TextWrappingModes.Normal;
+            AddLayoutElement(_networkModalMessage.gameObject, -1, 30);
+
+            var proxyLabel = CreateText("Proxy URL", modal, 12, FontStyles.Bold, TextSecondary);
+            AddLayoutElement(proxyLabel.gameObject, -1, 18);
+
+            _proxyInput = CreateInput(modal, "http://127.0.0.1:8080");
+            AddLayoutElement(_proxyInput.gameObject, -1, 42);
+
+            var cookiesLabel = CreateText("Browser cookies", modal, 12, FontStyles.Bold, TextSecondary);
+            AddLayoutElement(cookiesLabel.gameObject, -1, 18);
+
+            _browserCookiesInput = CreateInput(modal, "chrome / edge / firefox / brave");
+            AddLayoutElement(_browserCookiesInput.gameObject, -1, 42);
+
+            var actions = CreateRect("Network Actions", modal);
+            AddLayoutElement(actions.gameObject, -1, 44);
+            var actionLayout = actions.gameObject.AddComponent<HorizontalLayoutGroup>();
+            actionLayout.spacing = 8;
+            actionLayout.childAlignment = TextAnchor.MiddleRight;
+            actionLayout.childControlWidth = false;
+            actionLayout.childControlHeight = true;
+            actionLayout.childForceExpandWidth = false;
+
+            var spacer = CreateRect("Spacer", actions);
+            AddLayoutElement(spacer.gameObject, -1, 40, 1);
+            var clear = CreateButton(actions, "Clear", "Clear settings", SurfaceHover, TextSecondary, ClearNetworkSettings);
+            AddLayoutElement(clear.gameObject, 82, 40);
+            var cancel = CreateButton(actions, "Cancel", "Cancel", SurfaceHover, TextSecondary, CloseNetworkModal);
+            AddLayoutElement(cancel.gameObject, 94, 40);
+            var save = CreateButton(actions, "Save", "Save settings", Accent, Background, SaveNetworkSettings);
+            AddLayoutElement(save.gameObject, 94, 40);
         }
 
         private void CreateToast(Transform parent)
@@ -690,7 +772,7 @@ namespace Vidow
             ExternalProcessRun run;
             try
             {
-                run = YtDlpBridge.StartMetadata(tool.ExecutablePath, uri.AbsoluteUri);
+                run = YtDlpBridge.StartMetadata(tool.ExecutablePath, uri.AbsoluteUri, CreateYtDlpNetworkOptions());
             }
             catch (Exception ex)
             {
@@ -970,6 +1052,103 @@ namespace Vidow
             _pendingFolderVideo = null;
         }
 
+        private void ShowNetworkModal()
+        {
+            _proxyInput.text = _proxyUrl ?? string.Empty;
+            _browserCookiesInput.text = _browserCookies ?? string.Empty;
+            _networkModalMessage.color = TextSecondary;
+            _networkModalMessage.text = "yt-dlp network settings";
+            _networkModalOverlay.SetActive(true);
+            _proxyInput.Select();
+            _proxyInput.ActivateInputField();
+        }
+
+        private void SaveNetworkSettings()
+        {
+            var proxy = (_proxyInput.text ?? string.Empty).Trim();
+            var cookies = (_browserCookiesInput.text ?? string.Empty).Trim();
+            if (!IsValidProxyUrl(proxy))
+            {
+                _networkModalMessage.color = Danger;
+                _networkModalMessage.text = "Proxy must start with http://, https://, socks4://, socks5://, or socks5h://.";
+                return;
+            }
+
+            _proxyUrl = proxy;
+            _browserCookies = cookies;
+            PlayerPrefs.SetString(ProxyUrlPrefKey, _proxyUrl);
+            PlayerPrefs.SetString(BrowserCookiesPrefKey, _browserCookies);
+            PlayerPrefs.Save();
+            CloseNetworkModal();
+            UpdateNetworkStatusText();
+            ShowToast("Network settings saved.");
+        }
+
+        private void ClearNetworkSettings()
+        {
+            _proxyInput.text = string.Empty;
+            _browserCookiesInput.text = string.Empty;
+            _networkModalMessage.color = TextSecondary;
+            _networkModalMessage.text = "yt-dlp network settings";
+        }
+
+        private void CloseNetworkModal()
+        {
+            _networkModalOverlay.SetActive(false);
+        }
+
+        private YtDlpNetworkOptions CreateYtDlpNetworkOptions()
+        {
+            return new YtDlpNetworkOptions
+            {
+                ProxyUrl = _proxyUrl,
+                CookiesFromBrowser = _browserCookies
+            };
+        }
+
+        private void UpdateNetworkStatusText()
+        {
+            if (_networkStatusText == null)
+            {
+                return;
+            }
+
+            _networkStatusText.text = _networkReachable ? GetNetworkModeLabel() : "Offline";
+            _networkStatusText.color = _networkReachable ? Success : Warning;
+        }
+
+        private string GetNetworkModeLabel()
+        {
+            var hasProxy = !string.IsNullOrWhiteSpace(_proxyUrl);
+            var hasCookies = !string.IsNullOrWhiteSpace(_browserCookies);
+            if (hasProxy && hasCookies)
+            {
+                return "Net+";
+            }
+
+            if (hasProxy)
+            {
+                return "Proxy";
+            }
+
+            return hasCookies ? "Cookies" : "Online";
+        }
+
+        private static bool IsValidProxyUrl(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return true;
+            }
+
+            var lower = value.Trim().ToLowerInvariant();
+            return lower.StartsWith("http://", StringComparison.Ordinal) ||
+                   lower.StartsWith("https://", StringComparison.Ordinal) ||
+                   lower.StartsWith("socks4://", StringComparison.Ordinal) ||
+                   lower.StartsWith("socks5://", StringComparison.Ordinal) ||
+                   lower.StartsWith("socks5h://", StringComparison.Ordinal);
+        }
+
         private void StartDownloadInFolder(VideoItem item, string folder)
         {
             if (item == null || string.IsNullOrWhiteSpace(item.MediaUrl))
@@ -1118,7 +1297,7 @@ namespace Vidow
             ExternalProcessRun run;
             try
             {
-                run = YtDlpBridge.StartDownload(tool.ExecutablePath, job.Video, job.TempFilePath, ffmpegLocation);
+                run = YtDlpBridge.StartDownload(tool.ExecutablePath, job.Video, job.TempFilePath, ffmpegLocation, CreateYtDlpNetworkOptions());
             }
             catch (Exception ex)
             {

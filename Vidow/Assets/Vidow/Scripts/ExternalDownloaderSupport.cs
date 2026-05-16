@@ -22,6 +22,15 @@ namespace Vidow
         public string Message;
     }
 
+    public sealed class YtDlpNetworkOptions
+    {
+        public string ProxyUrl;
+        public string CookiesFromBrowser;
+
+        public bool HasProxy => !string.IsNullOrWhiteSpace(ProxyUrl);
+        public bool HasBrowserCookies => !string.IsNullOrWhiteSpace(CookiesFromBrowser);
+    }
+
     public sealed class ExternalProcessRun
     {
         private readonly object _gate = new object();
@@ -604,20 +613,24 @@ namespace Vidow
             });
         }
 
-        public static ExternalProcessRun StartMetadata(string executablePath, string url)
+        public static ExternalProcessRun StartMetadata(string executablePath, string url, YtDlpNetworkOptions networkOptions = null)
         {
             var toolDirectory = GetToolDirectory(executablePath);
-            return ExternalProcessRun.Start(executablePath, new[]
+            var arguments = new List<string>
             {
                 "--dump-single-json",
                 "--no-warnings",
                 "--skip-download",
-                "--no-playlist",
-                url
-            }, toolDirectory, CreateToolEnvironment(executablePath));
+                "--no-playlist"
+            };
+
+            AddNetworkOptions(arguments, networkOptions);
+            arguments.Add(url);
+
+            return ExternalProcessRun.Start(executablePath, arguments, toolDirectory, CreateToolEnvironment(executablePath));
         }
 
-        public static ExternalProcessRun StartDownload(string executablePath, VideoItem video, string outputPath, string ffmpegLocation = null)
+        public static ExternalProcessRun StartDownload(string executablePath, VideoItem video, string outputPath, string ffmpegLocation = null, YtDlpNetworkOptions networkOptions = null)
         {
             var format = string.IsNullOrWhiteSpace(video.ExternalFormatSelector) ? DefaultFormatSelector : video.ExternalFormatSelector;
             var toolDirectory = GetToolDirectory(executablePath);
@@ -632,6 +645,8 @@ namespace Vidow
                 "--paths",
                 "temp:" + tempDirectory
             };
+
+            AddNetworkOptions(arguments, networkOptions);
 
             if (!string.IsNullOrWhiteSpace(ffmpegLocation))
             {
@@ -655,6 +670,26 @@ namespace Vidow
             });
 
             return ExternalProcessRun.Start(executablePath, arguments, toolDirectory, CreateToolEnvironment(executablePath));
+        }
+
+        private static void AddNetworkOptions(List<string> arguments, YtDlpNetworkOptions options)
+        {
+            if (options == null)
+            {
+                return;
+            }
+
+            if (options.HasProxy)
+            {
+                arguments.Add("--proxy");
+                arguments.Add(options.ProxyUrl.Trim());
+            }
+
+            if (options.HasBrowserCookies)
+            {
+                arguments.Add("--cookies-from-browser");
+                arguments.Add(options.CookiesFromBrowser.Trim());
+            }
         }
 
         public static string GetStagingFilePath(string finalFilePath)
